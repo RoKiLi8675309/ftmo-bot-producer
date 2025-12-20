@@ -1,0 +1,8 @@
+#!C:\Projects\ftmo_bot_producer\venv_windows\Scripts\python.exe
+# -*- coding: UTF-8 -*-
+from __future__ import print_function, division, absolute_import
+
+from numba.misc.numba_entry import main
+
+if __name__ == "__main__":
+    main()
