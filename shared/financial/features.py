@@ -4,10 +4,11 @@
 # PATH: shared/financial/features.py
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional)
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk metrics.
-# AUDIT REMEDIATION (FOREX PLAN):
-#   - ADDED: Explicit Autoregressive Lags (Lag 1-3) to OnlineFeatureEngineer.
-#   - RETAINED: MetaLabeler for profitability filtering.
-#   - FIXED: Robust OFI and NaN sanitization.
+# AUDIT REMEDIATION (PHASE 2 - INDENTATION FIX):
+#   - FIXED: Strict indentation for root-level utility functions.
+#   - FIXED: Replaced river.stats.EWMean with local RecursiveEMA to fix TypeError.
+#   - RETAINED: StreamingIndicators (Recursive RSI, MACD, ATR).
+#   - RETAINED: AdaptiveTripleBarrier (Volatility Adaptive Labeling).
 # CRITICAL: Python 3.9 Compatible. Graceful degradation if ML libs missing.
 # =============================================================================
 from __future__ import annotations
@@ -34,9 +35,9 @@ try:
 except ImportError:
     SCIPY_AVAILABLE = False
 
-# River / Sklearn imports
+# River / Sklearn imports (Guarded)
 try:
-    from river import stats, utils, linear_model
+    from river import linear_model
     from sklearn.isotonic import IsotonicRegression
     ML_AVAILABLE = True
 except ImportError:
@@ -44,7 +45,173 @@ except ImportError:
 
 logger = logging.getLogger("Features")
 
-# --- 1. PROBABILITY CALIBRATOR ---
+# --- 0. HELPER MATH KERNELS (ROBUST) ---
+class RecursiveEMA:
+    """
+    Dependency-free Exponential Moving Average.
+    Solves compatibility issues with changing River API signatures.
+    Formula: S_t = alpha * Y_t + (1 - alpha) * S_{t-1}
+    """
+    def __init__(self, alpha: float):
+        self.alpha = alpha
+        self.value = None
+
+    def update(self, x: float):
+        if self.value is None:
+            self.value = x
+        else:
+            self.value = self.alpha * x + (1 - self.alpha) * self.value
+    
+    def get(self) -> float:
+        return self.value if self.value is not None else 0.0
+
+# --- 1. STREAMING INDICATORS (PHASE 2) ---
+class StreamingIndicators:
+    """
+    Recursive implementation of technical indicators.
+    Uses local RecursiveEMA to ensure stability.
+    """
+    def __init__(self, rsi_period=14, macd_fast=12, macd_slow=26, macd_sig=9, atr_period=14):
+        # We don't strictly need ML_AVAILABLE for this anymore, but we keep the guard if needed elsewhere
+        
+        # MACD Components
+        self.ema_fast = RecursiveEMA(alpha=2 / (macd_fast + 1))
+        self.ema_slow = RecursiveEMA(alpha=2 / (macd_slow + 1))
+        self.macd_signal = RecursiveEMA(alpha=2 / (macd_sig + 1))
+
+        # RSI Components
+        self.rsi_period = rsi_period
+        self.rsi_avg_gain = RecursiveEMA(alpha=1 / rsi_period)
+        self.rsi_avg_loss = RecursiveEMA(alpha=1 / rsi_period)
+        self.prev_price = None
+
+        # ATR Components (Volatility)
+        self.atr_mean = RecursiveEMA(alpha=1 / atr_period)
+        self.prev_close = None
+
+    def update(self, price: float, high: float, low: float) -> Dict[str, float]:
+        """
+        Updates recursive state and returns current indicator values.
+        """
+        features = {}
+
+        # 1. MACD Calculation
+        self.ema_fast.update(price)
+        self.ema_slow.update(price)
+        macd_line = self.ema_fast.get() - self.ema_slow.get()
+        self.macd_signal.update(macd_line)
+        histogram = macd_line - self.macd_signal.get()
+
+        features['macd_line'] = macd_line
+        features['macd_hist'] = histogram
+
+        # 2. RSI Calculation
+        if self.prev_price is not None:
+            change = price - self.prev_price
+            gain = max(0.0, change)
+            loss = max(0.0, -change)
+            
+            self.rsi_avg_gain.update(gain)
+            self.rsi_avg_loss.update(loss)
+            
+            avg_gain = self.rsi_avg_gain.get()
+            avg_loss = self.rsi_avg_loss.get()
+            
+            if avg_loss == 0:
+                rsi = 100.0 if avg_gain > 0 else 50.0
+            else:
+                rs = avg_gain / avg_loss
+                rsi = 100.0 - (100.0 / (1.0 + rs))
+            
+            features['rsi'] = rsi
+        else:
+            features['rsi'] = 50.0
+
+        # 3. ATR Calculation (True Range)
+        if self.prev_close is not None:
+            tr1 = high - low
+            tr2 = abs(high - self.prev_close)
+            tr3 = abs(low - self.prev_close)
+            true_range = max(tr1, tr2, tr3)
+            self.atr_mean.update(true_range)
+            features['atr'] = self.atr_mean.get()
+        else:
+            features['atr'] = high - low if (high > 0 and low > 0) else 0.001
+
+        # Update State
+        self.prev_price = price
+        self.prev_close = price
+
+        return features
+
+# --- 2. ADAPTIVE TRIPLE BARRIER (PHASE 2) ---
+class AdaptiveTripleBarrier:
+    """
+    Volatility-Adaptive Labeling.
+    Barriers expand/contract based on ATR.
+    """
+    def __init__(self, horizon_ticks: int = 12, risk_mult: float = 1.0, reward_mult: float = 2.0):
+        self.buffer = deque()
+        self.time_limit = horizon_ticks
+        self.risk_mult = risk_mult
+        self.reward_mult = reward_mult
+
+    def add_trade_opportunity(self, features: Dict[str, float], entry_price: float, current_atr: float, timestamp: float):
+        """
+        Registers a potential trade setup.
+        """
+        if current_atr <= 0: return
+
+        # Dynamic Barriers
+        take_profit = entry_price + (self.reward_mult * current_atr)
+        stop_loss = entry_price - (self.risk_mult * current_atr)
+
+        self.buffer.append({
+            'features': features,
+            'entry': entry_price,
+            'tp': take_profit,
+            'sl': stop_loss,
+            'start_time': timestamp,
+            'age': 0
+        })
+
+    def resolve_labels(self, current_high: float, current_low: float) -> List[Tuple[Dict[str, float], int]]:
+        """
+        Checks active trades against current price action.
+        Returns list of (features, label).
+        Label 1 = Success (TP Hit)
+        Label 0 = Failure (SL Hit or Timeout)
+        """
+        resolved = []
+        active = deque()
+
+        while self.buffer:
+            trade = self.buffer.popleft()
+            trade['age'] += 1
+            
+            label = None
+
+            # 1. Did price hit TP? (Bullish assumption for label 1)
+            if current_high >= trade['tp']:
+                label = 1 # SUCCESS
+
+            # 2. Did price hit SL?
+            elif current_low <= trade['sl']:
+                label = 0 # FAILURE
+
+            # 3. Timeout?
+            elif trade['age'] >= self.time_limit:
+                label = 0 # TIMEOUT (Treat as Fail)
+
+            if label is not None:
+                resolved.append((trade['features'], label))
+            else:
+                active.append(trade)
+
+        self.buffer = active
+        return resolved
+
+# --- 3. PROBABILITY CALIBRATOR ---
 class ProbabilityCalibrator:
     def __init__(self, window: int = 1000):
         self.window = window
@@ -67,36 +234,25 @@ class ProbabilityCalibrator:
         except Exception:
             return raw_prob
 
-
-# --- 2. META LABELER ---
+# --- 4. META LABELER ---
 class MetaLabeler:
     """
-    Secondary model that learns whether a primary signal (Buy/Sell) actually
-    resulted in profit after costs. Acts as a gatekeeper.
+    Secondary model that learns whether a primary signal resulted in profit.
     """
     def __init__(self):
         self.model = None
         self.buffer = deque(maxlen=1000)
         
         if ML_AVAILABLE:
-            # Simple Logistic Regression for binary profitability check
-            # Input: Features + Primary Action. Output: 1 (Profitable) / 0 (Loss)
             self.model = linear_model.LogisticRegression()
 
     def update(self, features: Dict[str, float], primary_action: int, outcome_pnl: float):
-        """
-        Train the meta-model.
-        primary_action: 1 (Buy), -1 (Sell), 0 (Hold)
-        outcome_pnl: Realized PnL (Net of costs)
-        """
         if not ML_AVAILABLE or primary_action == 0:
             return
 
-        # Target: 1 if profitable, 0 if loss
         y_meta = 1 if outcome_pnl > 0 else 0
         
         try:
-            # Inject primary action as a feature for the meta learner
             augmented_features = features.copy()
             augmented_features['primary_action'] = float(primary_action)
             
@@ -107,58 +263,65 @@ class MetaLabeler:
             logger.error(f"MetaLabeler Update Error: {e}")
 
     def predict(self, features: Dict[str, float], primary_action: int, threshold: float = 0.55) -> bool:
-        """
-        Returns True if the trade is likely to be profitable.
-        """
         if not ML_AVAILABLE or primary_action == 0:
-            return False # SAFE DEFAULT: Do not trade if ML is broken
+            return False 
             
         try:
             augmented_features = features.copy()
             augmented_features['primary_action'] = float(primary_action)
             clean_features = self._sanitize(augmented_features)
             
-            # predict_proba_one returns {0: prob_loss, 1: prob_profit}
             probs = self.model.predict_proba_one(clean_features)
             prob_profit = probs.get(1, 0.0)
             
             return prob_profit > threshold
         except Exception as e:
             logger.error(f"MetaLabeler Predict Error: {e}")
-            return False # Block on error
+            return False 
 
     def _sanitize(self, features: Dict[str, float]) -> Dict[str, float]:
         clean = {}
         for k, v in features.items():
             if math.isfinite(v):
-                clean[k] = v
+                clean[k] = float(v)
             else:
                 clean[k] = 0.0
         return clean
 
-
-# --- 3. ONLINE FEATURE ENGINEER ---
+# --- 5. ONLINE FEATURE ENGINEER (PHASE 2) ---
 class OnlineFeatureEngineer:
     def __init__(self, window_size: int = 50):
         self.window_size = window_size
         self.prices = deque(maxlen=window_size)
         self.volumes = deque(maxlen=window_size)
         self.returns = deque(maxlen=window_size)
+        
+        # Phase 2: Integrated Streaming Indicators (Uses RecursiveEMA)
+        self.indicators = StreamingIndicators()
+        
+        # Legacy components
         self.entropy = EntropyMonitor(window=window_size)
         self.vpin = VPINMonitor(bucket_size=1000)
-        self.frac_diff = IncrementalFracDiff(d=0.6, window=window_size)
+        self.frac_diff = IncrementalFracDiff(d=0.3, window=window_size)
         self.vol_monitor = VolatilityMonitor(window=20)
         self.last_price = None
 
     def update(self, price: float, timestamp: float, volume: float, 
+               high: Optional[float] = None, low: Optional[float] = None,
                buy_vol: float = 0.0, sell_vol: float = 0.0, 
                time_feats: Dict[str, float] = None) -> Dict[str, float]:
         
         if time_feats is None:
             time_feats = {'sin_hour': 0.0, 'cos_hour': 0.0}
 
+        # Fallback if high/low not provided
+        if high is None: high = price
+        if low is None: low = price
+
         self.prices.append(price)
         self.volumes.append(volume)
+        
+        # Returns
         if self.last_price and self.last_price > 0:
             ret = math.log(price / self.last_price) if price > 0 else 0.0
             self.returns.append(ret)
@@ -166,6 +329,10 @@ class OnlineFeatureEngineer:
             ret = 0.0
             self.returns.append(0.0)
 
+        # 1. Update Recursive Indicators (Phase 2 Core)
+        tech_feats = self.indicators.update(price, high, low)
+        
+        # 2. Update Legacy Metrics
         entropy_val = self.entropy.update(price)
         vpin_val = self.vpin.update(volume, price, buy_vol, sell_vol)
         fd_price = self.frac_diff.update(price)
@@ -187,13 +354,7 @@ class OnlineFeatureEngineer:
             net_change = abs(price_list[-1] - price_list[0])
             er_val = net_change / abs_change_sum if abs_change_sum > 0 else 0.0
 
-        z_score_val = 0.0
-        if len(self.prices) >= 20:
-            mu = np.mean(self.prices)
-            sigma = np.std(self.prices)
-            if sigma > 1e-9:
-                z_score_val = (price - mu) / sigma
-
+        # Z-Scores
         price_z = 0.0
         volume_z = 0.0
         if len(self.prices) > 1:
@@ -209,22 +370,14 @@ class OnlineFeatureEngineer:
 
         self.last_price = price
 
-        # --- AUDIT FIX: Explicit Autoregressive Lags (Step 3) ---
-        # Since we removed the Sampler, we must feed history manually
-        # to the linear model to restore 'Memory'.
-        lags = {}
-        # Ensure we have enough history. 
-        # returns[-1] is current t. returns[-2] is t-1 (Lag 1).
-        if len(self.returns) >= 4:
-            lags['return_lag_1'] = self.returns[-2]
-            lags['return_lag_2'] = self.returns[-3]
-            lags['return_lag_3'] = self.returns[-4]
-        else:
-            lags['return_lag_1'] = 0.0
-            lags['return_lag_2'] = 0.0
-            lags['return_lag_3'] = 0.0
-
         raw_features = {
+            # Recursive Technicals
+            'rsi': tech_feats['rsi'],
+            'macd_line': tech_feats['macd_line'],
+            'macd_hist': tech_feats['macd_hist'],
+            'atr': tech_feats['atr'],
+            
+            # Statistical / Microstructure
             'frac_diff': fd_price,
             'volatility': volatility_val,
             'entropy': entropy_val,
@@ -232,12 +385,12 @@ class OnlineFeatureEngineer:
             'hurst': hurst_val,
             'ofi': ofi_val,
             'efficiency_ratio': er_val,
-            'z_score': z_score_val,
+            
+            # Normalized
             'price_z': price_z,
             'volume_z': volume_z,
-            'price_raw': price,
             'return_raw': ret,
-            **lags,
+            
             **time_feats
         }
 
@@ -252,9 +405,11 @@ class OnlineFeatureEngineer:
                 clean[k] = 0.0
         return clean
 
-
-# --- 4. STREAMING TRIPLE BARRIER ---
+# --- 6. STREAMING TRIPLE BARRIER (LEGACY COMPATIBILITY) ---
 class StreamingTripleBarrier:
+    """
+    Maintained for legacy compatibility.
+    """
     def __init__(self, vol_multiplier: float = 2.0, barrier_len: int = 50, horizon_ticks: int = 100):
         self.vol_multiplier = vol_multiplier
         self.horizon_ticks = horizon_ticks
@@ -291,8 +446,7 @@ class StreamingTripleBarrier:
             }
         return resolved
 
-
-# --- 5. ENTROPY MONITOR ---
+# --- 7. ENTROPY MONITOR ---
 class EntropyMonitor:
     def __init__(self, window: int = 50):
         self.buffer = deque(maxlen=window)
@@ -309,8 +463,7 @@ class EntropyMonitor:
         except Exception:
             return 0.5
 
-
-# --- 6. VPIN MONITOR ---
+# --- 8. VPIN MONITOR ---
 class VPINMonitor:
     def __init__(self, bucket_size: float = 1000):
         self.bucket_size = bucket_size
@@ -353,8 +506,7 @@ class VPINMonitor:
         if total_vol < 1e-9: return 0.5
         return diff_vol / total_vol
 
-
-# --- 7. INCREMENTAL FRAC DIFF ---
+# --- 9. INCREMENTAL FRAC DIFF ---
 class IncrementalFracDiff:
     def __init__(self, d: float = 0.6, window: int = 20):
         self.d = d
@@ -373,10 +525,9 @@ class IncrementalFracDiff:
         self.memory.append(price)
         if len(self.memory) < self.window: return 0.0
         series = np.array(self.memory)
-        return np.dot(self.weights, series)
+        return float(np.dot(self.weights, series))
 
-
-# --- 8. VOLATILITY MONITOR ---
+# --- 10. VOLATILITY MONITOR ---
 class VolatilityMonitor:
     def __init__(self, window: int = 20):
         self.returns = deque(maxlen=window)
@@ -387,8 +538,7 @@ class VolatilityMonitor:
         val = np.std(self.returns)
         return val if math.isfinite(val) else 0.001
 
-
-# --- 9. UTILS & JIT FUNCTIONS ---
+# --- 11. UTILS & JIT FUNCTIONS ---
 @njit
 def calculate_hurst(ts):
     n = len(ts)
