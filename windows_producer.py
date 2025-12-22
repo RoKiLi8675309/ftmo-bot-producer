@@ -490,11 +490,12 @@ class HybridProducer:
                     
                     calculated_start = current_balance - realized_pnl_today
                     
-                    # Apply
+                    # Apply & Broadcast to Redis for Linux Engine
                     self.ftmo_monitor.starting_equity_of_day = calculated_start
                     self.r.set(CONFIG['redis']['risk_keys']['daily_starting_equity'], calculated_start)
+                    self.r.set("bot:account_size", self.ftmo_monitor.initial_balance) # Broadcast Account Size
                     
-                    log.info(f"{LogSymbols.SUCCESS} RISK STATE VERIFIED: Start Equity: {calculated_start:.2f} | Realized Today: {realized_pnl_today:.2f}")
+                    log.info(f"{LogSymbols.SUCCESS} RISK STATE VERIFIED: Start Equity: {calculated_start:.2f} | Realized Today: {realized_pnl_today:.2f} | Account: {self.ftmo_monitor.initial_balance}")
                     return # Success
 
             except Exception as e:
