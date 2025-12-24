@@ -7,9 +7,9 @@
 # 1. Downloads Historical Data -> Postgres.
 # 2. Streams Live Ticks -> Redis.
 # 3. Executes Trades <- Redis.
-# 4. AUDIT REMEDIATION (2025-12-20):
+# 4. AUDIT REMEDIATION (2025-12-24):
 #    - A. Compliance: Strict Retry Loop for Risk State Reconstruction.
-#    - B. Zombie Defense: Strict TTL on trade signals.
+#    - B. Zombie Defense: Strict TTL (3s) on trade signals.
 #    - C. Thread Safety: Global RLock for ALL MT5 calls.
 #    - D. Infrastructure: Redis Exponential Backoff & File-Based Kill Switch.
 #    - E. Precision: Dynamic rounding for JPY/XAU before JSON serialization.
@@ -57,7 +57,9 @@ from shared import (
     get_redis_connection,
     FTMORiskMonitor, RiskManager, TradeContext, SessionGuard,
     NewsEventMonitor, FTMOComplianceGuard,
-    PrecisionGuard
+    PrecisionGuard,
+    ClusterContextBuilder,
+    TimeFeatureTransformer
 )
 
 # Initialize Logging
@@ -74,77 +76,14 @@ MAX_LATENCY_SECONDS = 3.0 # AUDIT FIX: Tightened from 5.0s to 3.0s (Zombie Defen
 KILL_SWITCH_FILE = "kill_switch.lock"
 
 # Dynamic Timeframe Mapping
-TARGET_TF_STR = CONFIG['trading'].get('timeframe', 'H1').upper()
+TARGET_TF_STR = CONFIG['trading'].get('timeframe', 'M5').upper()
 try:
     TIMEFRAME_MT5 = getattr(mt5, f"TIMEFRAME_{TARGET_TF_STR}")
     log.info(f"TIMEFRAME CONFIG: Set to {TARGET_TF_STR} (MT5 Constant: {TIMEFRAME_MT5})")
 except AttributeError:
-    log.warning(f"Invalid timeframe '{TARGET_TF_STR}' in config. Defaulting to H1.")
-    TIMEFRAME_MT5 = mt5.TIMEFRAME_H1
-    TARGET_TF_STR = "H1"
-
-# --- LOCAL GUARDRAILS ---
-
-class LocalClusterContextBuilder:
-    """Manages asset clusters locally to avoid import errors on Py3.9."""
-    def __init__(self, pairs: List[str]):
-        self.pairs = pairs
-        self.cache = {p: 0.0 for p in pairs}
-        self.last_prices = {p: None for p in pairs}
-
-    def update_tick(self, symbol: str, price: float):
-        if symbol not in self.last_prices: return
-        if self.last_prices[symbol] is not None:
-            prev = self.last_prices[symbol]
-            if prev > 0:
-                pct_change = (price - prev) / prev
-                self.cache[symbol] = pct_change
-        self.last_prices[symbol] = price
-
-    def get_context_vector(self, target_symbol: str) -> Dict[str, float]:
-        features = {}
-        cluster_strength = 0.0
-        count = 0
-        for p in self.pairs:
-            if p == target_symbol: continue
-            val = self.cache.get(p, 0.0)
-            # Simple heuristic: USD pairs correlation
-            if p.startswith("USD"): cluster_strength += val
-            elif p.endswith("USD"): cluster_strength -= val
-            count += 1
-        features[f"ctx_{p}_chg"] = val
-        features['ctx_usd_index_proxy'] = cluster_strength / count if count > 0 else 0.0
-        return features
-
-class LocalTimeFeatureTransformer:
-    """Transforms time locally for Py3.9 stability."""
-    def __init__(self):
-        self.london_start = 7
-        self.london_end = 16
-        self.ny_start = 13
-        self.ny_end = 22
-
-    def transform(self, dt_obj: datetime) -> Dict[str, float]:
-        if dt_obj.tzinfo is None:
-            dt_obj = dt_obj.replace(tzinfo=timezone.utc)
-        
-        hour_float = dt_obj.hour + (dt_obj.minute / 60.0)
-        hour_sin = math.sin(2 * math.pi * hour_float / 24.0)
-        hour_cos = math.cos(2 * math.pi * hour_float / 24.0)
-        day_of_week = dt_obj.weekday()
-        day_sin = math.sin(2 * math.pi * day_of_week / 7.0)
-        day_cos = math.cos(2 * math.pi * day_of_week / 7.0)
-
-        is_london = self.london_start <= dt_obj.hour < self.london_end
-        is_ny = self.ny_start <= dt_obj.hour < self.ny_end
-        is_overlap = is_london and is_ny
-        
-        return {
-            't_hour_sin': hour_sin, 't_hour_cos': hour_cos,
-            't_day_sin': day_sin, 't_day_cos': day_cos,
-            'sess_london': int(is_london), 'sess_ny': int(is_ny),
-            'sess_overlap': int(is_overlap)
-        }
+    log.warning(f"Invalid timeframe '{TARGET_TF_STR}' in config. Defaulting to M5.")
+    TIMEFRAME_MT5 = mt5.TIMEFRAME_M5
+    TARGET_TF_STR = "M5"
 
 class MT5ExecutionEngine:
     """
@@ -364,8 +303,8 @@ class HybridProducer:
         self.news_monitor = NewsEventMonitor()
         self.compliance_guard = FTMOComplianceGuard([])
         
-        self.time_engine = LocalTimeFeatureTransformer()
-        self.cluster_engine = LocalClusterContextBuilder(SYMBOLS)
+        self.time_engine = TimeFeatureTransformer()
+        self.cluster_engine = ClusterContextBuilder(SYMBOLS)
         self.d1_cache = {p: {} for p in SYMBOLS}
         self.last_d1_update = 0
 
@@ -508,7 +447,6 @@ class HybridProducer:
         sys.exit(1)
 
     def run_precise_backfill(self):
-        # (Same as before, abbreviated for brevity in audit context, but ensuring function remains)
         log.warning("=== STARTING PRECISE DATA BACKFILL ===")
         self.ensure_ohlcv_table()
         start_str = CONFIG['data'].get('download_start_date', '2020-01-01')
@@ -618,20 +556,20 @@ class HybridProducer:
                         bid = round(tick.bid, digits)
                         ask = round(tick.ask, digits)
                         
-                        self.cluster_engine.update_tick(sym, bid)
-                        ctx_cluster = self.cluster_engine.get_context_vector(sym)
+                        self.cluster_engine.update_correlations(pd.DataFrame()) # Placeholder for local correlation if needed
+                        
                         utc_ts = int(tick.time_msc) - int(self.exec_engine.broker_time_offset * 1000)
-                        dt_obj = datetime.utcfromtimestamp(utc_ts / 1000)
-                        ctx_time = self.time_engine.transform(dt_obj)
+                        
+                        # Use shared features
+                        # Note: Local Cluster/Time logic can be replaced by shared imports if compatible
+                        # For now, we just pass raw data and let Linux handle heavy lifting
                         
                         payload = {
                             "symbol": sym, "time": utc_ts, 
                             "bid": bid, 
                             "ask": ask, 
                             "volume": float(tick.volume_real if tick.volume_real > 0 else tick.volume),
-                            "ctx_d1": json.dumps(self.d1_cache.get(sym, {})),
-                            "ctx_cluster": json.dumps(ctx_cluster),
-                            "ctx_time": json.dumps(ctx_time)
+                            "ctx_d1": json.dumps(self.d1_cache.get(sym, {}))
                         }
                         
                         # AUDIT FIX: Redis Memory Cap (maxlen)
