@@ -877,7 +877,7 @@ class HybridProducer:
                     # Keep only recent 1000
                     recent = list(self.notified_tickets)[-1000:]
                     self.notified_tickets = set(recent)
-                     
+                      
                 with self.mt5_lock:
                     orders = mt5.orders_get()
                     if orders:
