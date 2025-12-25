@@ -14,6 +14,9 @@
 #    - D. Infrastructure: Redis Exponential Backoff & File-Based Kill Switch.
 #    - E. Precision: Dynamic rounding for JPY/XAU before JSON serialization.
 #    - F. AUTO-DETECT: Updates Account Size from Broker to prevent false Liquidations.
+#
+# QUANT OVERHAUL (2025-12-25):
+#    - G. MICROSTRUCTURE: Added Level 2 (DOM) polling to capture Bid/Ask Volumes.
 # =============================================================================
 
 import os
@@ -369,6 +372,7 @@ class HybridProducer:
     def connect_mt5(self):
         """
         Initializes MT5 with robust path handling from Config.
+        NEW: Enables Level 2 Data (Market Book) subscription.
         """
         with self.mt5_lock:
             # 1. Retrieve Creds
@@ -400,10 +404,16 @@ class HybridProducer:
             else:
                 log.warning("MT5 Credentials missing in Config. Running in initialized mode only.")
 
-            # 4. Subscribe to Symbols
+            # 4. Subscribe to Symbols & Market Book (L2 Data)
             for sym in SYMBOLS:
                 if not mt5.symbol_select(sym, True):
                     log.error(f"Failed to select symbol {sym}")
+                else:
+                    # NEW: Enable Market Book stream for OFI calculation
+                    if not mt5.market_book_add(sym):
+                        log.warning(f"Failed to subscribe to Market Book for {sym}. OFI may be unavailable.")
+                    else:
+                        log.info(f"Subscribed to Market Book (L2) for {sym}")
 
     def _reconstruct_risk_state_from_history(self):
         """
@@ -558,8 +568,42 @@ class HybridProducer:
                             break
         return monitored
 
+    def _get_l2_volumes(self, symbol: str, bid_price: float, ask_price: float) -> Tuple[float, float]:
+        """
+        Queries the Market Book (DOM) to get available volume at Best Bid and Best Ask.
+        This provides the raw material for Order Flow Imbalance (OFI).
+        """
+        try:
+            # market_book_get returns a tuple of BookInfo structs
+            # struct: (type, price, volume, volume_real)
+            # type 1 = Sell (Ask), type 2 = Buy (Bid)
+            book = mt5.market_book_get(symbol)
+            if not book:
+                return 0.0, 0.0
+            
+            # Since MT5 books can be noisy, we strictly look for the volume 
+            # exactly at the current Best Bid/Ask price provided by the Tick.
+            # Alternatively, we sum the top band.
+            
+            bid_vol = 0.0
+            ask_vol = 0.0
+            
+            for item in book:
+                # item.type: 2=Bid, 1=Ask (MT5 Constants: BOOK_TYPE_SELL=1, BOOK_TYPE_BUY=2)
+                if item.type == 2: # Bid
+                    if abs(item.price - bid_price) < 1e-5:
+                        bid_vol += item.volume_real
+                elif item.type == 1: # Ask
+                    if abs(item.price - ask_price) < 1e-5:
+                        ask_vol += item.volume_real
+            
+            return bid_vol, ask_vol
+            
+        except Exception:
+            return 0.0, 0.0
+
     def _tick_stream_loop(self):
-        log.info("Starting Tick Stream...")
+        log.info("Starting Tick Stream (Microstructure Enabled)...")
         interval = CONFIG['producer']['tick_interval_seconds']
         redis_failures = 0
         
@@ -589,19 +633,23 @@ class HybridProducer:
                         bid = round(tick.bid, digits)
                         ask = round(tick.ask, digits)
                         
-                        self.cluster_engine.update_correlations(pd.DataFrame()) # Placeholder for local correlation if needed
+                        # --- MICROSTRUCTURE INGESTION ---
+                        # Poll L2 Data to get exact volume at Top of Book
+                        bid_vol, ask_vol = self._get_l2_volumes(sym, bid, ask)
+                        # --------------------------------
+                        
+                        self.cluster_engine.update_correlations(pd.DataFrame()) 
                         
                         utc_ts = int(tick.time_msc) - int(self.exec_engine.broker_time_offset * 1000)
                         
                         # Use shared features
-                        # Note: Local Cluster/Time logic can be replaced by shared imports if compatible
-                        # For now, we just pass raw data and let Linux handle heavy lifting
-                        
                         payload = {
                             "symbol": sym, "time": utc_ts, 
                             "bid": bid, 
                             "ask": ask, 
                             "volume": float(tick.volume_real if tick.volume_real > 0 else tick.volume),
+                            "bid_vol": float(bid_vol), # NEW: Level 2 Volume
+                            "ask_vol": float(ask_vol), # NEW: Level 2 Volume
                             "ctx_d1": json.dumps(self.d1_cache.get(sym, {}))
                         }
                         
