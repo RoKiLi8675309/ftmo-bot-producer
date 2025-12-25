@@ -5,8 +5,8 @@
 # DESCRIPTION:
 # The Gateway to the Market.
 # 1. Downloads Historical Data -> Postgres.
-# 2. Streams Live Ticks -> Redis.
-# 3. Executes Trades <- Redis.
+# 2. Streams Live Ticks -> Redis (Now with D1 & H4 Context).
+# 3. Executes Trades <- Redis (Now with Limit Order Execution).
 #
 # AUDIT REMEDIATION (2025-12-25):
 #    - A. Compliance: Strict Retry Loop for Risk State Reconstruction.
@@ -16,8 +16,9 @@
 #    - E. Precision: Dynamic rounding for JPY/XAU before JSON serialization.
 #    - F. AUTO-DETECT: Updates Account Size from Broker to prevent false Liquidations.
 #
-# QUANT OVERHAUL (RETAIL FALLBACK):
-#    - G. MICROSTRUCTURE: Robust Level 2 (DOM) polling with TICK RULE FALLBACK.
+# QUANT OVERHAUL (MTF MEMORY & EXECUTION):
+#    - G. DATA INGESTION: Streams H4 Data (OHLC + RSI) alongside D1 Context.
+#    - H. EXECUTION: Implements Passive Limit Orders (Bid-0.5 / Ask+0.5) to capture spread.
 # =============================================================================
 
 import os
@@ -79,6 +80,9 @@ MIDNIGHT_BUFFER_MINUTES = 30
 MAX_LATENCY_SECONDS = 3.0 # AUDIT FIX: Tightened from 5.0s to 3.0s (Zombie Defense)
 KILL_SWITCH_FILE = "kill_switch.lock"
 
+# Execution Settings (Limit Order Offset)
+LIMIT_OFFSET_PIPS = CONFIG['trading'].get('limit_order_offset_pips', 0.5)
+
 # Dynamic Timeframe Mapping
 TARGET_TF_STR = CONFIG['trading'].get('timeframe', 'M5').upper()
 try:
@@ -94,6 +98,7 @@ class MT5ExecutionEngine:
     Robust Execution Engine.
     Handles Idempotency, Retries, Broker Constraints, and Metrics.
     AUDIT FIX: All MT5 calls guarded by self.lock (Re-entrant).
+    QUANT UPGRADE: Switches from Market to Limit Orders for Spread Capture.
     """
     def __init__(self, redis_client, lock: threading.RLock, risk_monitor: FTMORiskMonitor):
         self.lock = lock
@@ -158,6 +163,9 @@ class MT5ExecutionEngine:
         return None
 
     def execute_trade(self, request: Dict[str, Any], max_retries: int = 3) -> Optional[Dict[str, Any]]:
+        """
+        Executes a trade request using Limit Orders to capture spread.
+        """
         symbol = request.get("symbol")
         if not symbol: return None
         
@@ -165,8 +173,35 @@ class MT5ExecutionEngine:
         symbol_info = self._get_symbol_info(symbol)
         if not symbol_info: return None
         
-        # Sanitize Price/Volume using PrecisionGuard
+        # QUANT UPGRADE: Calculate Limit Price
+        # Buy Limit @ Bid - Offset
+        # Sell Limit @ Ask + Offset
         try:
+            with self.lock:
+                tick = mt5.symbol_info_tick(symbol)
+                if not tick: return None
+            
+            pip_size = symbol_info.point * 10 if symbol_info.digits == 3 or symbol_info.digits == 5 else symbol_info.point
+            
+            # Logic Branch: If it's a DEAL action (Entry), convert to LIMIT
+            if request["action"] == mt5.TRADE_ACTION_DEAL:
+                offset_val = LIMIT_OFFSET_PIPS * pip_size
+                
+                if request["type"] == mt5.ORDER_TYPE_BUY:
+                    limit_price = tick.bid - offset_val
+                    request["type"] = mt5.ORDER_TYPE_BUY_LIMIT
+                    request["price"] = limit_price
+                    request["action"] = mt5.TRADE_ACTION_PENDING
+                elif request["type"] == mt5.ORDER_TYPE_SELL:
+                    limit_price = tick.ask + offset_val
+                    request["type"] = mt5.ORDER_TYPE_SELL_LIMIT
+                    request["price"] = limit_price
+                    request["action"] = mt5.TRADE_ACTION_PENDING
+                
+                # Set Time GTC (Managed by Zombie Monitor)
+                request["type_time"] = mt5.ORDER_TIME_GTC 
+            
+            # Sanitize Price/Volume using PrecisionGuard
             if "price" in request:
                 request["price"] = PrecisionGuard.normalize_price(request["price"], symbol, symbol_info)
             
@@ -213,7 +248,7 @@ class MT5ExecutionEngine:
                 log.info(f"EXECUTION SUCCESS: {symbol} Ticket: {result.order}")
                 return result._asdict()
             elif result.retcode == mt5.TRADE_RETCODE_PLACED:
-                log.info(f"Order Placed: {symbol} Ticket: {result.order}")
+                log.info(f"LIMIT ORDER PLACED: {symbol} Ticket: {result.order} @ {request['price']}")
                 return result._asdict()
             elif result.retcode in [mt5.TRADE_RETCODE_REQUOTE, mt5.TRADE_RETCODE_CONNECTION, mt5.TRADE_RETCODE_PRICE_OFF]:
                 try: self.r.incr("broker:metric:requotes") 
@@ -222,13 +257,16 @@ class MT5ExecutionEngine:
                 log.warning(f"Recoverable Error ({result.retcode}). Retrying...")
                 time.sleep(0.5 * (2 ** attempt))
                 
-                # Refresh Price
-                if request["action"] == mt5.TRADE_ACTION_DEAL:
+                # Refresh Price for Limit Order if necessary (Adaptive Limit)
+                if request["action"] == mt5.TRADE_ACTION_PENDING:
                     with self.lock:
                         tick = mt5.symbol_info_tick(symbol)
                         if tick:
-                            new_price = tick.ask if request["type"] == mt5.ORDER_TYPE_BUY else tick.bid
-                            if "price" in request: request["price"] = new_price
+                            offset_val = LIMIT_OFFSET_PIPS * pip_size
+                            if request["type"] == mt5.ORDER_TYPE_BUY_LIMIT:
+                                request["price"] = tick.bid - offset_val
+                            elif request["type"] == mt5.ORDER_TYPE_SELL_LIMIT:
+                                request["price"] = tick.ask + offset_val
                     continue
             else:
                 log.error(f"EXECUTION FAILURE: {symbol} Retcode: {result.retcode} ({result.comment})")
@@ -260,9 +298,9 @@ class MT5ExecutionEngine:
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": mt5.ORDER_FILLING_IOC
             }
-            result = self.execute_trade(request)
+            result = mt5.order_send(request) # Helper calls execute_trade but here we call raw order_send to avoid recursion loops
 
-            if result and result.get('retcode') == mt5.TRADE_RETCODE_DONE:
+            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
                 time.sleep(0.2)
                 deals = mt5.history_deals_get(position=position_id)
                 if deals:
@@ -315,7 +353,8 @@ class HybridProducer:
         self.time_engine = TimeFeatureTransformer()
         self.cluster_engine = ClusterContextBuilder(SYMBOLS)
         self.d1_cache = {p: {} for p in SYMBOLS}
-        self.last_d1_update = 0
+        self.h4_cache = {p: {} for p in SYMBOLS} # QUANT UPGRADE: H4 Cache
+        self.last_context_update = 0
 
         self.notified_tickets = set()
         
@@ -633,9 +672,11 @@ class HybridProducer:
 
             start = time.time()
             try:
-                if time.time() - self.last_d1_update > 60:
+                # QUANT UPGRADE: Update D1 and H4 Context periodically
+                if time.time() - self.last_context_update > 60:
                     self._update_d1_context()
-                    self.last_d1_update = time.time()
+                    self._update_h4_context()
+                    self.last_context_update = time.time()
                 
                 pipe = self.r.pipeline()
                 for sym in self.monitored_symbols:
@@ -668,16 +709,17 @@ class HybridProducer:
                         
                         utc_ts = int(tick.time_msc) - int(self.exec_engine.broker_time_offset * 1000)
                         
-                        # Use shared features
+                        # QUANT UPGRADE: Include H4 and D1 Context in Payload
                         payload = {
                             "symbol": sym, "time": utc_ts, 
                             "bid": bid, 
                             "ask": ask, 
-                            "price": price_now, # Explicitly send price
+                            "price": price_now, 
                             "volume": current_vol,
-                            "bid_vol": float(bid_vol), # NEW: Level 2 or Estimated Volume
-                            "ask_vol": float(ask_vol), # NEW: Level 2 or Estimated Volume
-                            "ctx_d1": json.dumps(self.d1_cache.get(sym, {}))
+                            "bid_vol": float(bid_vol),
+                            "ask_vol": float(ask_vol),
+                            "ctx_d1": json.dumps(self.d1_cache.get(sym, {})),
+                            "ctx_h4": json.dumps(self.h4_cache.get(sym, {})) # NEW: H4 Data
                         }
                         
                         # AUDIT FIX: Redis Memory Cap (maxlen)
@@ -717,6 +759,38 @@ class HybridProducer:
                         'open': float(r['open']), 'high': float(r['high']), 
                         'low': float(r['low']), 'close': float(r['close']),
                         'ema200': float(ema)
+                    }
+
+    def _update_h4_context(self):
+        """
+        QUANT UPGRADE: Fetches H4 data and calculates RSI(14).
+        Stores in self.h4_cache.
+        """
+        for sym in SYMBOLS:
+            with self.mt5_lock:
+                # Fetch enough bars for RSI(14)
+                rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_H4, 1, 30)
+                if rates is not None and len(rates) > 14:
+                    r = rates[-1]
+                    
+                    # Manual RSI Calc using pandas to avoid heavy deps if possible, but pandas is imported
+                    df = pd.DataFrame(rates)
+                    delta = df['close'].diff()
+                    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+                    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                    
+                    rs = gain / loss
+                    rsi = 100 - (100 / (1 + rs))
+                    current_rsi = rsi.iloc[-1]
+                    
+                    if np.isnan(current_rsi): current_rsi = 50.0
+
+                    self.h4_cache[sym] = {
+                        'open': float(r['open']),
+                        'high': float(r['high']),
+                        'low': float(r['low']),
+                        'close': float(r['close']),
+                        'rsi': float(current_rsi)
                     }
 
     def _trade_listener(self):
@@ -916,14 +990,17 @@ class HybridProducer:
             time.sleep(60)
 
     def _pending_order_monitor(self):
+        """
+        Monitors pending Limit Orders. Cancels zombies (older than 60s) to enforce expiration.
+        Updates status on fills.
+        """
         while self.running:
             try:
                 # AUDIT FIX: Memory Leak Prevention (Cleanup notified tickets)
                 if len(self.notified_tickets) > 5000:
-                    # Keep only recent 1000
                     recent = list(self.notified_tickets)[-1000:]
                     self.notified_tickets = set(recent)
-                      
+                    
                 with self.mt5_lock:
                     orders = mt5.orders_get()
                     if orders:
@@ -935,8 +1012,11 @@ class HybridProducer:
                                             'ticket': order.ticket, 'symbol': order.symbol, 'type': 'FILLED'
                                         }))
                                         self.notified_tickets.add(order.ticket)
+                                
+                                # QUANT UPGRADE: Tight Expiration Control
+                                # Cancel Limit Orders older than 60 seconds
                                 if time.time() - order.time_setup > 60:
-                                    log.info(f"Cancelling Zombie Order {order.ticket}")
+                                    log.info(f"Cancelling Zombie Order {order.ticket} (Pending > 60s)")
                                     req = {"action": mt5.TRADE_ACTION_REMOVE, "order": order.ticket}
                                     mt5.order_send(req)
             except Exception as e:
