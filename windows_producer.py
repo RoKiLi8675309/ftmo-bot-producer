@@ -99,10 +99,8 @@ class MT5ExecutionEngine:
         self.risk_monitor = risk_monitor
         self.broker_time_offset = 0.0
         
-        with self.lock:
-            if not mt5.initialize():
-                log.critical(f"MT5 Handler Init failed: {mt5.last_error()}")
-                raise RuntimeError("MT5 Handler Init Failed")
+        # Initial connection check is handled by the main producer class
+        # We assume mt5 is initialized when this engine is used
         
         if not self._calculate_broker_offset_robust():
             log.critical("CRITICAL: Timezone Sync Failed. Aborting startup.")
@@ -298,7 +296,14 @@ class HybridProducer:
             max_daily_loss_pct=CONFIG['risk_management']['max_daily_loss_pct'],
             redis_client=self.r
         )
+        
+        # Initialization Sequence
+        self._optimize_process()
+        self.connect_mt5() # Explicit MT5 Connection using Config
+        
+        # Init Execution Engine AFTER MT5 is connected
         self.exec_engine = MT5ExecutionEngine(self.r, self.mt5_lock, self.ftmo_monitor)
+        
         self.session_guard = SessionGuard()
         self.news_monitor = NewsEventMonitor()
         self.compliance_guard = FTMOComplianceGuard([])
@@ -310,9 +315,6 @@ class HybridProducer:
 
         self.notified_tickets = set()
 
-        # Initialization Sequence
-        self._optimize_process()
-        self.connect_mt5()
         self.run_precise_backfill()
         
         # AUDIT FIX: Retry-guarded Risk State Reconstruction
@@ -365,12 +367,43 @@ class HybridProducer:
             log.warning(f"Process optimization failed: {e}")
 
     def connect_mt5(self):
+        """
+        Initializes MT5 with robust path handling from Config.
+        """
         with self.mt5_lock:
-            if not mt5.initialize():
-                log.critical(f"MT5 Init Failed: {mt5.last_error()}")
+            # 1. Retrieve Creds
+            mt5_conf = CONFIG.get('mt5', {})
+            path = mt5_conf.get('path')
+            login = mt5_conf.get('login')
+            password = mt5_conf.get('password')
+            server = mt5_conf.get('server')
+
+            # 2. Initialize
+            init_params = {}
+            if path and os.path.exists(path):
+                init_params['path'] = path
+            
+            if not mt5.initialize(**init_params):
+                log.critical(f"MT5 Initialize Failed: {mt5.last_error()}")
                 sys.exit(1)
+            
+            # 3. Login (if credentials provided)
+            if login and password and server:
+                try:
+                    if not mt5.login(login=int(login), password=password, server=server):
+                        log.critical(f"MT5 Login Failed: {mt5.last_error()}")
+                        sys.exit(1)
+                    log.info(f"MT5 Logged in as {login} on {server}")
+                except Exception as e:
+                    log.error(f"MT5 Login Exception: {e}")
+                    sys.exit(1)
+            else:
+                log.warning("MT5 Credentials missing in Config. Running in initialized mode only.")
+
+            # 4. Subscribe to Symbols
             for sym in SYMBOLS:
-                mt5.symbol_select(sym, True)
+                if not mt5.symbol_select(sym, True):
+                    log.error(f"Failed to select symbol {sym}")
 
     def _reconstruct_risk_state_from_history(self):
         """
