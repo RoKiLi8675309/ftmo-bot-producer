@@ -16,9 +16,10 @@
 #    - E. Precision: Dynamic rounding for JPY/XAU before JSON serialization.
 #    - F. AUTO-DETECT: Updates Account Size from Broker to prevent false Liquidations.
 #
-# QUANT OVERHAUL (MTF MEMORY & EXECUTION):
+# PROJECT PHOENIX UPDATE:
 #    - G. DATA INGESTION: Streams H4 Data (OHLC + RSI) alongside D1 Context.
-#    - H. EXECUTION: Implements Passive Limit Orders (Bid-0.5 / Ask+0.5) to capture spread.
+#    - H. EXECUTION: Implements Passive Limit Orders.
+#    - I. CLEANUP: Removed Market Book (L2) dependencies. Pure L1 Tick Rule.
 # =============================================================================
 
 import os
@@ -415,7 +416,7 @@ class HybridProducer:
     def connect_mt5(self):
         """
         Initializes MT5 with robust path handling from Config.
-        NEW: Enables Level 2 Data (Market Book) subscription.
+        Project Phoenix: Pure L1 Data (No Market Book).
         """
         with self.mt5_lock:
             # 1. Retrieve Creds
@@ -447,16 +448,12 @@ class HybridProducer:
             else:
                 log.warning("MT5 Credentials missing in Config. Running in initialized mode only.")
 
-            # 4. Subscribe to Symbols & Market Book (L2 Data)
+            # 4. Subscribe to Symbols
             for sym in SYMBOLS:
                 if not mt5.symbol_select(sym, True):
                     log.error(f"Failed to select symbol {sym}")
                 else:
-                    # NEW: Enable Market Book stream for OFI calculation
-                    if not mt5.market_book_add(sym):
-                        log.warning(f"Failed to subscribe to Market Book for {sym}. OFI will degrade to Tick Rule Fallback.")
-                    else:
-                        log.info(f"Subscribed to Market Book (L2) for {sym}")
+                    log.info(f"Subscribed to {sym} (L1 Mode)")
 
     def _reconstruct_risk_state_from_history(self):
         """
@@ -611,31 +608,12 @@ class HybridProducer:
                             break
         return monitored
 
-    def _get_l2_volumes(self, symbol: str, bid_price: float, ask_price: float, current_vol: float, current_price: float) -> Tuple[float, float]:
+    def _estimate_flow_volumes(self, symbol: str, current_vol: float, current_price: float) -> Tuple[float, float]:
         """
-        Queries the Market Book (DOM) to get available volume at Best Bid and Best Ask.
-        FALLBACK: If DOM is empty (Retail/Demo broker), uses TICK RULE to estimate flow.
+        Estimates flows using the TICK RULE (Lee-Ready).
+        Project Phoenix strictly uses L1 proxies, so we rely on price action.
         """
         try:
-            # 1. Try Market Book (Institutional Data)
-            book = mt5.market_book_get(symbol)
-            if book:
-                bid_vol = 0.0
-                ask_vol = 0.0
-                for item in book:
-                    # item.type: 2=Bid, 1=Ask
-                    if item.type == 2: # Bid
-                        if abs(item.price - bid_price) < 1e-5:
-                            bid_vol += item.volume_real
-                    elif item.type == 1: # Ask
-                        if abs(item.price - ask_price) < 1e-5:
-                            ask_vol += item.volume_real
-                
-                # If we got valid data, return it
-                if bid_vol > 0 or ask_vol > 0:
-                    return float(bid_vol), float(ask_vol)
-            
-            # 2. Fallback: Tick Rule (Retail Estimation)
             # Logic: Compare current price to last price to assign volume direction
             last_price = self.last_prices.get(symbol, current_price)
             
@@ -655,11 +633,11 @@ class HybridProducer:
                 return half_vol, half_vol
             
         except Exception:
-            # Safe Fallback on crash
+            # Safe Fallback
             return 0.0, 0.0
 
     def _tick_stream_loop(self):
-        log.info("Starting Tick Stream (Microstructure Enabled)...")
+        log.info("Starting Tick Stream...")
         interval = CONFIG['producer']['tick_interval_seconds']
         redis_failures = 0
         
@@ -697,9 +675,9 @@ class HybridProducer:
                         # Use Last price if available, else Mid
                         price_now = tick.last if tick.last > 0 else (bid + ask) / 2.0
                         
-                        # --- MICROSTRUCTURE INGESTION (WITH FALLBACK) ---
-                        # Poll L2 Data OR Estimate via Tick Rule
-                        bid_vol, ask_vol = self._get_l2_volumes(sym, bid, ask, current_vol, price_now)
+                        # --- PHOENIX FLOW INGESTION ---
+                        # Estimate flows via Tick Rule
+                        bid_vol, ask_vol = self._estimate_flow_volumes(sym, current_vol, price_now)
                         
                         # Update state for next tick comparison
                         self.last_prices[sym] = price_now
