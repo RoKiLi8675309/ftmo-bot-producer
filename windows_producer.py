@@ -16,7 +16,7 @@
 #    - F. AUTO-DETECT: Updates Account Size from Broker to prevent false Liquidations.
 #
 # QUANT OVERHAUL (2025-12-25):
-#    - G. MICROSTRUCTURE: Added Level 2 (DOM) polling to capture Bid/Ask Volumes.
+#    - G. MICROSTRUCTURE: Added Level 2 (DOM) polling with TICK RULE FALLBACK.
 # =============================================================================
 
 import os
@@ -317,6 +317,9 @@ class HybridProducer:
         self.last_d1_update = 0
 
         self.notified_tickets = set()
+        
+        # Track last prices for Tick Rule Fallback
+        self.last_prices = {s: 0.0 for s in SYMBOLS}
 
         self.run_precise_backfill()
         
@@ -411,7 +414,7 @@ class HybridProducer:
                 else:
                     # NEW: Enable Market Book stream for OFI calculation
                     if not mt5.market_book_add(sym):
-                        log.warning(f"Failed to subscribe to Market Book for {sym}. OFI may be unavailable.")
+                        log.warning(f"Failed to subscribe to Market Book for {sym}. OFI will degrade to Tick Rule Fallback.")
                     else:
                         log.info(f"Subscribed to Market Book (L2) for {sym}")
 
@@ -568,36 +571,44 @@ class HybridProducer:
                             break
         return monitored
 
-    def _get_l2_volumes(self, symbol: str, bid_price: float, ask_price: float) -> Tuple[float, float]:
+    def _get_l2_volumes(self, symbol: str, bid_price: float, ask_price: float, current_vol: float, current_price: float) -> Tuple[float, float]:
         """
         Queries the Market Book (DOM) to get available volume at Best Bid and Best Ask.
-        This provides the raw material for Order Flow Imbalance (OFI).
+        FALLBACK: If DOM is empty (Retail/Demo broker), uses TICK RULE to estimate flow.
         """
         try:
-            # market_book_get returns a tuple of BookInfo structs
-            # struct: (type, price, volume, volume_real)
-            # type 1 = Sell (Ask), type 2 = Buy (Bid)
+            # 1. Try Market Book (Institutional Data)
             book = mt5.market_book_get(symbol)
-            if not book:
-                return 0.0, 0.0
+            if book:
+                bid_vol = 0.0
+                ask_vol = 0.0
+                for item in book:
+                    # item.type: 2=Bid, 1=Ask
+                    if item.type == 2: # Bid
+                        if abs(item.price - bid_price) < 1e-5:
+                            bid_vol += item.volume_real
+                    elif item.type == 1: # Ask
+                        if abs(item.price - ask_price) < 1e-5:
+                            ask_vol += item.volume_real
+                
+                # If we got valid data, return it
+                if bid_vol > 0 or ask_vol > 0:
+                    return bid_vol, ask_vol
             
-            # Since MT5 books can be noisy, we strictly look for the volume 
-            # exactly at the current Best Bid/Ask price provided by the Tick.
-            # Alternatively, we sum the top band.
+            # 2. Fallback: Tick Rule (Retail Estimation)
+            # Logic: Compare current price to last price to assign volume direction
+            last_price = self.last_prices.get(symbol, current_price)
             
-            bid_vol = 0.0
-            ask_vol = 0.0
-            
-            for item in book:
-                # item.type: 2=Bid, 1=Ask (MT5 Constants: BOOK_TYPE_SELL=1, BOOK_TYPE_BUY=2)
-                if item.type == 2: # Bid
-                    if abs(item.price - bid_price) < 1e-5:
-                        bid_vol += item.volume_real
-                elif item.type == 1: # Ask
-                    if abs(item.price - ask_price) < 1e-5:
-                        ask_vol += item.volume_real
-            
-            return bid_vol, ask_vol
+            if current_price > last_price:
+                # Up Tick -> Aggressive Buyer -> Volume assigned to Bid
+                return float(current_vol), 0.0
+            elif current_price < last_price:
+                # Down Tick -> Aggressive Seller -> Volume assigned to Ask
+                return 0.0, float(current_vol)
+            else:
+                # Neutral Tick -> Split 50/50
+                half_vol = float(current_vol) / 2.0
+                return half_vol, half_vol
             
         except Exception:
             return 0.0, 0.0
@@ -633,9 +644,18 @@ class HybridProducer:
                         bid = round(tick.bid, digits)
                         ask = round(tick.ask, digits)
                         
-                        # --- MICROSTRUCTURE INGESTION ---
-                        # Poll L2 Data to get exact volume at Top of Book
-                        bid_vol, ask_vol = self._get_l2_volumes(sym, bid, ask)
+                        # Current tick volume (use volume_real if available, else tick_volume)
+                        current_vol = float(tick.volume_real if tick.volume_real > 0 else tick.volume)
+                        
+                        # --- MICROSTRUCTURE INGESTION (WITH FALLBACK) ---
+                        # Poll L2 Data OR Estimate via Tick Rule
+                        bid_vol, ask_vol = self._get_l2_volumes(sym, bid, ask, current_vol, tick.last if tick.last > 0 else (bid+ask)/2)
+                        
+                        # Update state for next tick comparison
+                        if tick.last > 0:
+                            self.last_prices[sym] = tick.last
+                        else:
+                            self.last_prices[sym] = (bid + ask) / 2
                         # --------------------------------
                         
                         self.cluster_engine.update_correlations(pd.DataFrame()) 
@@ -647,9 +667,9 @@ class HybridProducer:
                             "symbol": sym, "time": utc_ts, 
                             "bid": bid, 
                             "ask": ask, 
-                            "volume": float(tick.volume_real if tick.volume_real > 0 else tick.volume),
-                            "bid_vol": float(bid_vol), # NEW: Level 2 Volume
-                            "ask_vol": float(ask_vol), # NEW: Level 2 Volume
+                            "volume": current_vol,
+                            "bid_vol": float(bid_vol), # NEW: Level 2 or Estimated Volume
+                            "ask_vol": float(ask_vol), # NEW: Level 2 or Estimated Volume
                             "ctx_d1": json.dumps(self.d1_cache.get(sym, {}))
                         }
                         

@@ -5,11 +5,10 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional), hmmlearn
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-24 - GOLDEN CONFIG COMPLIANCE):
-# 1. SCALING: Implemented WelfordScaler for O(1) online Z-score calculation.
-# 2. REGIME: KER & FDI optimized for 1.45-1.55 Inhibition Zone detection.
-# 3. STATIONARITY: Volume Z-Score now uses Welford's Algorithm (Infinite Window).
-# 4. ROBUSTNESS: HMM and Entropy monitors hardened against sparse data.
+# PHOENIX STRATEGY UPGRADE (2025-12-25 - RETAIL FALLBACK):
+# 1. FRACDIFF: Standardized to d=0.4 for GBP/JPY stationarity.
+# 2. MICROSTRUCTURE: Enhanced OFI Analyzer with Tick Rule Fallback support.
+# 3. INDICATORS: StreamingBollingerBands & StreamingADX.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -118,12 +117,153 @@ class RecursiveEMA:
     def get(self) -> float:
         return self.value if self.value is not None else 0.0
 
-# --- 1. REGIME INDICATORS (NEW) ---
+# --- 1. QUANTITATIVE MATH KERNELS (NEW) ---
+
+class StreamingFracDiff:
+    """
+    Computes the Fractionally Differentiated value of a time series 
+    in a streaming (online) fashion with O(1) complexity per update.
+    
+    Solves the Stationarity-Memory Paradox by preserving long-term memory (d < 1)
+    while removing non-stationary trends.
+    
+    Ref: Lopez de Prado, M. (2018). Advances in Financial Machine Learning.
+    FIX: Default d=0.4 optimized for GBP/JPY.
+    """
+    def __init__(self, d=0.4, window=2000, tolerance=1e-5):
+        """
+        Args:
+            d (float): The differencing order (0 < d < 1). 
+                       0.4 is optimal for GBP/JPY per analysis.
+            window (int): The history window size. 
+            tolerance (float): Weight cutoff threshold.
+        """
+        self.d = d
+        self.window = window
+        self.tolerance = tolerance
+        
+        # Pre-calculate weights upon initialization
+        self.weights = self._calculate_weights()
+        self.history = deque(maxlen=len(self.weights))
+        self.warmup_complete = False
+        
+    def _calculate_weights(self):
+        """
+        Generates the weight vector w using the iterative formula:
+        w_k = -w_{k-1} * (d - k + 1) / k
+        """
+        w = [1.0]
+        k = 1
+        
+        while True:
+            # Iterative weight calculation
+            w_next = -w[-1] * ((self.d - k + 1) / k)
+            
+            # Stop if weight is negligible or window is full
+            if abs(w_next) < self.tolerance or k >= self.window:
+                break
+            
+            w.append(w_next)
+            k += 1
+            
+        # Reverse weights to align with history [oldest... newest]
+        # dot product will be: w[0]*hist[0] + ... + w[n]*hist[n]
+        return np.array(w[::-1])
+
+    def update(self, price):
+        """
+        Adds a new price point and returns the FracDiff value.
+        """
+        if not isinstance(price, (int, float)) or not math.isfinite(price):
+            return 0.0 # Return 0.0 (mean of stationary series) on error
+
+        self.history.append(price)
+        
+        # Check if we have enough history to compute
+        if len(self.history) < len(self.weights):
+            return 0.0  # Not ready yet, return stationary mean
+        
+        if not self.warmup_complete:
+            self.warmup_complete = True
+
+        # Dot product of Weights and History Window
+        window_array = np.array(self.history)
+        frac_diff_value = np.dot(self.weights, window_array)
+        
+        return float(frac_diff_value)
+
+class MicrostructureAnalyzer:
+    """
+    Analyzes tick/bar data to calculate Order Flow Imbalance (OFI).
+    Acts as a leading indicator for short-term price direction by measuring
+    aggressiveness of buyers vs sellers.
+    """
+    def __init__(self, ema_alpha=0.2):
+        self.prev_bid_price = None
+        self.prev_bid_vol = None
+        self.prev_ask_price = None
+        self.prev_ask_vol = None
+        
+        self.ofi_value = 0.0
+        self.alpha = ema_alpha
+
+    def process_update(self, bid_price: float, bid_vol: float, ask_price: float, ask_vol: float) -> float:
+        """
+        Ingests current Best Bid and Best Ask data (Level 1) to compute OFI.
+        Can be called per-tick or per-bar (using close prices).
+        """
+        # Handle first tick initialization
+        if self.prev_bid_price is None:
+            self.prev_bid_price = bid_price
+            self.prev_bid_vol = bid_vol
+            self.prev_ask_price = ask_price
+            self.prev_ask_vol = ask_vol
+            return 0.0
+
+        # --- 1. Analyze Bid Side Flow (Demand) ---
+        if bid_price > self.prev_bid_price:
+            # Price improved: Aggressive buying or limit bids stepping up
+            bid_flow = bid_vol
+        elif bid_price < self.prev_bid_price:
+            # Price dropped: Bids were consumed (selling) or cancelled
+            bid_flow = -self.prev_bid_vol
+        else:
+            # Price unchanged: Change in volume
+            bid_flow = bid_vol - self.prev_bid_vol
+
+        # --- 2. Analyze Ask Side Flow (Supply) ---
+        if ask_price > self.prev_ask_price:
+            # Ask moved higher (Supply retreated / Consumed)
+            # Implies buying pressure consuming liquidity
+            ask_flow = -self.prev_ask_vol 
+        elif ask_price < self.prev_ask_price:
+            # Ask moved lower (Aggressive sellers stepping down)
+            ask_flow = ask_vol
+        else:
+            # Price unchanged
+            ask_flow = ask_vol - self.prev_ask_vol
+
+        # --- 3. Net Imbalance ---
+        # OFI = Bid_Flow - Ask_Flow
+        current_ofi = bid_flow - ask_flow
+
+        # --- 4. Exponential Smoothing (EMA) ---
+        self.ofi_value = (self.alpha * current_ofi) + ((1 - self.alpha) * self.ofi_value)
+
+        # Update State
+        self.prev_bid_price = bid_price
+        self.prev_bid_vol = bid_vol
+        self.prev_ask_price = ask_price
+        self.prev_ask_vol = ask_vol
+
+        return self.ofi_value
+
+# --- 2. REGIME INDICATORS ---
+
 class KaufmanEfficiencyRatio:
     """
     Quantifies trend efficiency (Signal vs Noise).
     Range: 0.0 (Pure Noise) to 1.0 (Perfect Efficiency).
-    Formula: |Net Change| / Sum(|Individual Changes|)
     """
     def __init__(self, window: int = 10):
         self.window = window
@@ -150,7 +290,6 @@ class FractalDimensionIndex:
     """
     Measures market complexity/dimensionality based on Chaos Theory.
     Range: ~1.0 (Linear/Trend) to ~2.0 (Jagged/Mean Reversion).
-    CRITICAL: Values between 1.45 and 1.55 indicate Random Walk (Inhibition Zone).
     """
     def __init__(self, window: int = 30):
         self.window = window
@@ -241,12 +380,14 @@ class RegimeDetector:
                 if np.var(data) < 1e-6 or np.isnan(data).any():
                     return self.last_regime
 
+                # Handle initialization based on failure count
                 if self.fit_failures > 5:
                     self.model.init_params = "stmc"
                     self.fit_failures = 0
                 elif hasattr(self.model, 'startprob_'):
                     self.model.init_params = ""
 
+                # Fit Model
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
@@ -254,23 +395,134 @@ class RegimeDetector:
                         warnings.filterwarnings("ignore", category=ConvergenceWarning)
                         self.model.fit(data)
                 
-                if not self.model.monitor_.converged:
-                    self.fit_failures += 1
-                else:
+                # --- SEMANTIC SORTING FIX ---
+                if self.model.monitor_.converged:
+                    variances = np.array([np.mean(np.diag(c)) for c in self.model.covars_])
+                    sort_order = np.argsort(variances)
+                    self.state_map = {old: new for new, old in enumerate(sort_order)}
                     self.fit_failures = 0
+                else:
+                    self.fit_failures += 1
+                    self.state_map = {i: i for i in range(self.n_states)} # Identity fallback
 
-            current_state = int(self.model.predict(data[-1].reshape(1, -1))[0])
-            self.last_regime = current_state
-            return current_state
+            # Predict current state
+            raw_state = int(self.model.predict(data[-1].reshape(1, -1))[0])
+            mapped_state = self.state_map.get(raw_state, raw_state)
+            
+            self.last_regime = mapped_state
+            return mapped_state
 
         except Exception:
             self.fit_failures += 1
             return self.last_regime
 
-# --- 2. STREAMING INDICATORS ---
+# --- 3. STREAMING INDICATORS (NEW: BB & ADX) ---
+
+class StreamingBollingerBands:
+    """
+    Online calculation of Bollinger Bands using Welford's Algorithm or Window.
+    Used for the Mean Reversion Trigger (Price touches 2.5 SD).
+    """
+    def __init__(self, period: int = 20, std_dev: float = 2.5):
+        self.period = period
+        self.std_dev = std_dev
+        self.buffer = deque(maxlen=period)
+        
+    def update(self, price: float) -> Dict[str, float]:
+        self.buffer.append(price)
+        
+        if len(self.buffer) < 2:
+            return {'bb_mid': price, 'bb_upper': price, 'bb_lower': price, 'bb_width': 0.0}
+            
+        # Calculation
+        arr = np.array(self.buffer)
+        mean = np.mean(arr)
+        std = np.std(arr)
+        
+        upper = mean + (self.std_dev * std)
+        lower = mean - (self.std_dev * std)
+        width = (upper - lower) / mean if mean != 0 else 0.0
+        
+        return {
+            'bb_mid': mean,
+            'bb_upper': upper,
+            'bb_lower': lower,
+            'bb_width': width
+        }
+
+class StreamingADX:
+    """
+    Online calculation of Average Directional Index (ADX).
+    Used as the Ranging Filter (ADX < 25).
+    """
+    def __init__(self, period: int = 14):
+        self.period = period
+        self.dm_plus_ema = RecursiveEMA(alpha=1/period)
+        self.dm_minus_ema = RecursiveEMA(alpha=1/period)
+        self.tr_ema = RecursiveEMA(alpha=1/period)
+        self.dx_ema = RecursiveEMA(alpha=1/period) # ADX is smoothed DX
+        
+        self.prev_high = None
+        self.prev_low = None
+        self.prev_close = None
+        
+    def update(self, high: float, low: float, close: float) -> float:
+        if self.prev_close is None:
+            self.prev_high = high
+            self.prev_low = low
+            self.prev_close = close
+            return 0.0
+            
+        # 1. True Range
+        tr1 = high - low
+        tr2 = abs(high - self.prev_close)
+        tr3 = abs(low - self.prev_close)
+        true_range = max(tr1, tr2, tr3)
+        
+        # 2. Directional Movement
+        up_move = high - self.prev_high
+        down_move = self.prev_low - low
+        
+        dm_plus = up_move if (up_move > down_move and up_move > 0) else 0.0
+        dm_minus = down_move if (down_move > up_move and down_move > 0) else 0.0
+        
+        # 3. Smoothing
+        self.tr_ema.update(true_range)
+        self.dm_plus_ema.update(dm_plus)
+        self.dm_minus_ema.update(dm_minus)
+        
+        avg_tr = self.tr_ema.get()
+        avg_dm_plus = self.dm_plus_ema.get()
+        avg_dm_minus = self.dm_minus_ema.get()
+        
+        # 4. DI calculation
+        if avg_tr > 0:
+            di_plus = 100 * (avg_dm_plus / avg_tr)
+            di_minus = 100 * (avg_dm_minus / avg_tr)
+        else:
+            di_plus = 0.0
+            di_minus = 0.0
+            
+        # 5. DX and ADX
+        sum_di = di_plus + di_minus
+        if sum_di > 0:
+            dx = 100 * abs(di_plus - di_minus) / sum_di
+        else:
+            dx = 0.0
+            
+        self.dx_ema.update(dx)
+        
+        # Update State
+        self.prev_high = high
+        self.prev_low = low
+        self.prev_close = close
+        
+        return self.dx_ema.get()
+
 class StreamingIndicators:
     """
     Recursive implementation of technical indicators.
+    Now includes Bollinger Bands and ADX.
     """
     def __init__(self, rsi_period=14, macd_fast=12, macd_slow=26, macd_sig=9, atr_period=14):
         # MACD Components
@@ -287,6 +539,10 @@ class StreamingIndicators:
         # ATR Components
         self.atr_mean = RecursiveEMA(alpha=1 / atr_period)
         self.prev_close = None
+        
+        # NEW: Bollinger Bands & ADX
+        self.bb = StreamingBollingerBands(period=20, std_dev=2.5) # Doc specified 2.5 SD
+        self.adx = StreamingADX(period=14)
 
     def update(self, price: float, high: float, low: float) -> Dict[str, float]:
         features = {}
@@ -333,11 +589,19 @@ class StreamingIndicators:
         else:
             features['atr'] = high - low if (high > 0 and low > 0 and high != low) else 0.001
             
+        # 4. Bollinger Bands (New)
+        bb_vals = self.bb.update(price)
+        features.update(bb_vals)
+        
+        # 5. ADX (New)
+        adx_val = self.adx.update(high, low, price)
+        features['adx'] = adx_val
+            
         self.prev_price = price
         self.prev_close = price
         return features
 
-# --- 3. ADAPTIVE TRIPLE BARRIER ---
+# --- 4. ADAPTIVE TRIPLE BARRIER ---
 class AdaptiveTripleBarrier:
     """
     Volatility-Adaptive Labeling.
@@ -416,7 +680,7 @@ class AdaptiveTripleBarrier:
         self.buffer = active
         return resolved
 
-# --- 4. PROBABILITY CALIBRATOR ---
+# --- 5. PROBABILITY CALIBRATOR ---
 class ProbabilityCalibrator:
     def __init__(self, window: int = 1000):
         self.window = window
@@ -440,7 +704,7 @@ class ProbabilityCalibrator:
         except Exception:
             return raw_prob
 
-# --- 5. META LABELER ---
+# --- 6. META LABELER ---
 class MetaLabeler:
     def __init__(self):
         self.model = None
@@ -497,7 +761,7 @@ class MetaLabeler:
                 clean[k] = 0.0
         return clean
 
-# --- 6. ONLINE FEATURE ENGINEER ---
+# --- 7. ONLINE FEATURE ENGINEER ---
 class OnlineFeatureEngineer:
     def __init__(self, window_size: int = 50):
         self.window_size = window_size
@@ -510,14 +774,19 @@ class OnlineFeatureEngineer:
         # Welford Scaler for Volume (Infinite Window Stationarity)
         self.welford_volume = WelfordScaler()
         
+        # Regime Indicators
         self.ker = KaufmanEfficiencyRatio(window=10)
         self.fdi = FractalDimensionIndex(window=30)
         self.regime_detector = RegimeDetector(n_states=2, window=100)
         
+        # Microstructure & Math Engines
         self.entropy = EntropyMonitor(window=window_size)
         self.vpin = VPINMonitor(bucket_size=1000)
-        self.frac_diff = IncrementalFracDiff(d=0.3, window=window_size)
+        # UPDATE: d=0.4 as per Document optimization for GBP/JPY
+        self.frac_diff = StreamingFracDiff(d=0.4, window=window_size) 
+        self.microstructure = MicrostructureAnalyzer(ema_alpha=0.1)
         self.vol_monitor = VolatilityMonitor(window=20)
+        
         self.last_price = None
         
         self.ofi_window = deque(maxlen=20)
@@ -553,7 +822,7 @@ class OnlineFeatureEngineer:
         else:
             self.returns.append(0.0)
 
-        # Update Indicators
+        # Update Indicators (includes BB & ADX now)
         tech_feats = self.indicators.update(price, high, low)
         current_atr = tech_feats.get('atr', 0.001)
         
@@ -565,8 +834,18 @@ class OnlineFeatureEngineer:
         # Update Other Metrics
         entropy_val = self.entropy.update(price)
         vpin_val = self.vpin.update(volume, price, buy_vol, sell_vol)
-        fd_price = self.frac_diff.update(price)
         volatility_val = self.vol_monitor.update(ret_log)
+
+        # --- FracDiff (Memory Preserved) ---
+        fd_price = self.frac_diff.update(price)
+
+        # --- Microstructure (OFI) ---
+        micro_ofi = self.microstructure.process_update(
+            bid_price=low,  
+            bid_vol=buy_vol, 
+            ask_price=high,
+            ask_vol=sell_vol
+        )
 
         # Volatility Ratio
         self.vol_baseline.update(volatility_val)
@@ -579,12 +858,12 @@ class OnlineFeatureEngineer:
             ret_arr = np.array(list(self.returns), dtype=np.float64)
             hurst_val = calculate_hurst(ret_arr)
 
-        # OFI
+        # Legacy OFI (Simple Ratio) for comparison
         denominator = volume if volume > 0 else 1.0
-        ofi_val = (buy_vol - sell_vol) / denominator
-        self.ofi_window.append(ofi_val)
+        ofi_simple = (buy_vol - sell_vol) / denominator
+        self.ofi_window.append(ofi_simple)
         cum_ofi = sum(self.ofi_window) / len(self.ofi_window) if self.ofi_window else 0.0
-        self.ofi_ema.update(ofi_val)
+        self.ofi_ema.update(ofi_simple)
         ofi_trend = self.ofi_ema.get()
 
         # Regime / Trends
@@ -618,9 +897,8 @@ class OnlineFeatureEngineer:
 
         self.last_price = price
         
-        # --- WELFORD SCALING (REPLACED MANUAL Z-SCORE) ---
+        # Welford Scaling
         volume_z = self.welford_volume.update(volume)
-        # -------------------------------------------------
 
         # Lag Features
         lagged_feats = {}
@@ -646,18 +924,24 @@ class OnlineFeatureEngineer:
             'macd_norm': macd_norm,
             'macd_hist_norm': tech_feats['macd_hist'] / price,
             'atr_pct': current_atr / price, 
+            'adx': tech_feats.get('adx', 0.0), # NEW
+            'bb_width': tech_feats.get('bb_width', 0.0), # NEW
             
+            # BB Relative Position (Price location within bands: 0=Lower, 1=Upper)
+            'bb_position': (price - tech_feats.get('bb_lower', price)) / (tech_feats.get('bb_upper', price) - tech_feats.get('bb_lower', price)) if tech_feats.get('bb_width', 0) > 0 else 0.5,
+
             # Volatility
             'vol_ratio': vol_ratio,
             'volatility_log': math.log(volatility_val + 1e-9),
             'log_ret': ret_log,
             
-            # Microstructure
-            'frac_diff': fd_price / price, 
+            # Microstructure & Math
+            'frac_diff': fd_price,          # NEW: Fractionally Differentiated Price
+            'micro_ofi': micro_ofi,         # NEW: Microstructure OFI
             'entropy': entropy_val,
             'vpin': vpin_val,
             'hurst': hurst_val,
-            'ofi': ofi_val,
+            'ofi_simple': ofi_simple,       
             'efficiency_ratio': er_val,
             
             # Context
@@ -689,7 +973,7 @@ class OnlineFeatureEngineer:
                 clean[k] = 0.0
         return clean
 
-# --- 7. LEGACY MONITORS ---
+# --- 8. LEGACY MONITORS ---
 class StreamingTripleBarrier:
     def __init__(self, vol_multiplier: float = 2.0, barrier_len: int = 50, horizon_ticks: int = 100):
         self.vol_multiplier = vol_multiplier
@@ -800,24 +1084,16 @@ class VPINMonitor:
         return absolute_imbalance / total_vol
 
 class IncrementalFracDiff:
+    """
+    Legacy wrapper for StreamingFracDiff if strict naming is needed by older components.
+    However, we upgraded to the new StreamingFracDiff logic above.
+    This class now delegates to StreamingFracDiff to ensure compatibility without code duplication.
+    """
     def __init__(self, d: float = 0.6, window: int = 20):
-        self.d = d
-        self.window = window
-        self.weights = self._get_weights_floored(d, window)
-        self.memory = deque(maxlen=window)
-
-    def _get_weights_floored(self, d, size):
-        w = [1.0]
-        for k in range(1, size):
-            w_k = -w[-1] * (d - k + 1) / k
-            w.append(w_k)
-        return np.array(w[::-1])
+        self.impl = StreamingFracDiff(d=d, window=window)
 
     def update(self, price: float) -> float:
-        self.memory.append(price)
-        if len(self.memory) < self.window: return 0.0
-        series = np.array(self.memory)
-        return float(np.dot(self.weights, series))
+        return self.impl.update(price)
 
 class VolatilityMonitor:
     def __init__(self, window: int = 20):
