@@ -5,10 +5,10 @@
 # DEPENDENCIES: shared, numpy, numba, scipy, river (optional), hmmlearn
 # DESCRIPTION: Mathematical kernels for Feature Engineering, Labeling, and Risk.
 #
-# PHOENIX STRATEGY UPGRADE (2025-12-25 - RETAIL FALLBACK):
-# 1. FRACDIFF: Standardized to d=0.4 for GBP/JPY stationarity.
-# 2. MICROSTRUCTURE: Enhanced OFI Analyzer with Tick Rule Fallback support.
-# 3. INDICATORS: StreamingBollingerBands & StreamingADX.
+# PHOENIX STRATEGY UPGRADE (2025-12-25 - MTF CONTEXT):
+# 1. MTF MEMORY: OnlineFeatureEngineer now digests D1 & H4 Context.
+# 2. ALIGNMENT: Calculates 'mtf_alignment' (D1 Trend == H4 Trend == M5 Trend).
+# 3. QUANT KERNELS: FracDiff (d=0.4), OFI Z-Score, and VPIN preserved.
 # =============================================================================
 from __future__ import annotations
 import math
@@ -64,7 +64,7 @@ class WelfordScaler:
     """
     Online Standardization using Welford's Algorithm.
     Computes running Mean and Variance in a single pass (O(1)).
-    Used to normalize non-stationary features (e.g., Volume) dynamically
+    Used to normalize non-stationary features (e.g., Volume, OFI) dynamically
     without the memory cost or lag of a sliding window.
     """
     def __init__(self):
@@ -194,69 +194,28 @@ class StreamingFracDiff:
 
 class MicrostructureAnalyzer:
     """
-    Analyzes tick/bar data to calculate Order Flow Imbalance (OFI).
-    Acts as a leading indicator for short-term price direction by measuring
-    aggressiveness of buyers vs sellers.
+    Analyzes Volume Bars to calculate Order Flow Imbalance (OFI).
+    
+    AUDIT FIX: Now calculates Flow Imbalance based on Execution (BuyVol - SellVol)
+    rather than Tick Depth Delta, as we are operating on aggregated Bars.
     """
-    def __init__(self, ema_alpha=0.2):
-        self.prev_bid_price = None
-        self.prev_bid_vol = None
-        self.prev_ask_price = None
-        self.prev_ask_vol = None
-        
-        self.ofi_value = 0.0
+    def __init__(self, ema_alpha=0.1):
+        self.ofi_smoothed = 0.0
         self.alpha = ema_alpha
 
-    def process_update(self, bid_price: float, bid_vol: float, ask_price: float, ask_vol: float) -> float:
+    def process_bar(self, buy_vol: float, sell_vol: float) -> float:
         """
-        Ingests current Best Bid and Best Ask data (Level 1) to compute OFI.
-        Can be called per-tick or per-bar (using close prices).
+        Ingests aggregated Buy/Sell volume for the bar.
+        Returns the Smoothed Net Flow (Raw).
+        Normalization (Z-Score) happens in FeatureEngineer via Welford.
         """
-        # Handle first tick initialization
-        if self.prev_bid_price is None:
-            self.prev_bid_price = bid_price
-            self.prev_bid_vol = bid_vol
-            self.prev_ask_price = ask_price
-            self.prev_ask_vol = ask_vol
-            return 0.0
-
-        # --- 1. Analyze Bid Side Flow (Demand) ---
-        if bid_price > self.prev_bid_price:
-            # Price improved: Aggressive buying or limit bids stepping up
-            bid_flow = bid_vol
-        elif bid_price < self.prev_bid_price:
-            # Price dropped: Bids were consumed (selling) or cancelled
-            bid_flow = -self.prev_bid_vol
-        else:
-            # Price unchanged: Change in volume
-            bid_flow = bid_vol - self.prev_bid_vol
-
-        # --- 2. Analyze Ask Side Flow (Supply) ---
-        if ask_price > self.prev_ask_price:
-            # Ask moved higher (Supply retreated / Consumed)
-            # Implies buying pressure consuming liquidity
-            ask_flow = -self.prev_ask_vol 
-        elif ask_price < self.prev_ask_price:
-            # Ask moved lower (Aggressive sellers stepping down)
-            ask_flow = ask_vol
-        else:
-            # Price unchanged
-            ask_flow = ask_vol - self.prev_ask_vol
-
-        # --- 3. Net Imbalance ---
-        # OFI = Bid_Flow - Ask_Flow
-        current_ofi = bid_flow - ask_flow
-
-        # --- 4. Exponential Smoothing (EMA) ---
-        self.ofi_value = (self.alpha * current_ofi) + ((1 - self.alpha) * self.ofi_value)
-
-        # Update State
-        self.prev_bid_price = bid_price
-        self.prev_bid_vol = bid_vol
-        self.prev_ask_price = ask_price
-        self.prev_ask_vol = ask_vol
-
-        return self.ofi_value
+        # Net Flow Imbalance
+        current_imbalance = buy_vol - sell_vol
+        
+        # Exponential Smoothing to reduce noise
+        self.ofi_smoothed = (self.alpha * current_imbalance) + ((1 - self.alpha) * self.ofi_smoothed)
+        
+        return self.ofi_smoothed
 
 # --- 2. REGIME INDICATORS ---
 
@@ -773,6 +732,7 @@ class OnlineFeatureEngineer:
         
         # Welford Scaler for Volume (Infinite Window Stationarity)
         self.welford_volume = WelfordScaler()
+        self.welford_ofi = WelfordScaler() # NEW: Scaler for OFI Z-Score
         
         # Regime Indicators
         self.ker = KaufmanEfficiencyRatio(window=10)
@@ -798,7 +758,12 @@ class OnlineFeatureEngineer:
                high: Optional[float] = None, low: Optional[float] = None, 
                buy_vol: float = 0.0, sell_vol: float = 0.0, 
                time_feats: Dict[str, float] = None,
-               sentiment: float = 0.0) -> Dict[str, float]:
+               sentiment: float = 0.0,
+               context_data: Dict[str, Any] = None) -> Dict[str, float]:
+        """
+        Updates internal state and returns a feature vector.
+        NOW ACCEPTS: context_data (Dictionary with D1 and H4 keys).
+        """
         
         if time_feats is None:
             time_feats = {'sin_hour': 0.0, 'cos_hour': 0.0}
@@ -840,12 +805,11 @@ class OnlineFeatureEngineer:
         fd_price = self.frac_diff.update(price)
 
         # --- Microstructure (OFI) ---
-        micro_ofi = self.microstructure.process_update(
-            bid_price=low,  
-            bid_vol=buy_vol, 
-            ask_price=high,
-            ask_vol=sell_vol
-        )
+        # Calculate raw smoothed OFI
+        raw_ofi_smoothed = self.microstructure.process_bar(buy_vol, sell_vol)
+        
+        # Convert to Z-Score using Welford Scaler
+        micro_ofi_z = self.welford_ofi.update(raw_ofi_smoothed)
 
         # Volatility Ratio
         self.vol_baseline.update(volatility_val)
@@ -909,6 +873,31 @@ class OnlineFeatureEngineer:
             else:
                 lagged_feats[f'ret_lag_{i}'] = 0.0
 
+        # --- MULTI-TIMEFRAME CONTEXT (D1 & H4) ---
+        d1_trend = 0.0
+        h4_rsi_norm = 0.5
+        mtf_align = 0.0
+        
+        if context_data:
+            # D1
+            d1 = context_data.get('d1', {})
+            d1_ema = d1.get('ema200', 0.0)
+            if d1_ema > 0:
+                d1_trend = 1.0 if price > d1_ema else -1.0
+            
+            # H4
+            h4 = context_data.get('h4', {})
+            h4_rsi = h4.get('rsi', 50.0)
+            h4_rsi_norm = h4_rsi / 100.0
+            h4_trend = 1.0 if h4_rsi > 50 else -1.0
+            
+            # M5 Trend (Derived from MACD Sign)
+            m5_trend = 1.0 if tech_feats['macd_line'] > 0 else -1.0
+            
+            # Alignment: D1 == H4 == M5
+            if d1_trend != 0 and (d1_trend == h4_trend == m5_trend):
+                mtf_align = 1.0
+
         raw_features = {
             'atr': current_atr,
             'volatility': volatility_val,
@@ -924,8 +913,8 @@ class OnlineFeatureEngineer:
             'macd_norm': macd_norm,
             'macd_hist_norm': tech_feats['macd_hist'] / price,
             'atr_pct': current_atr / price, 
-            'adx': tech_feats.get('adx', 0.0), # NEW
-            'bb_width': tech_feats.get('bb_width', 0.0), # NEW
+            'adx': tech_feats.get('adx', 0.0), 
+            'bb_width': tech_feats.get('bb_width', 0.0), 
             
             # BB Relative Position (Price location within bands: 0=Lower, 1=Upper)
             'bb_position': (price - tech_feats.get('bb_lower', price)) / (tech_feats.get('bb_upper', price) - tech_feats.get('bb_lower', price)) if tech_feats.get('bb_width', 0) > 0 else 0.5,
@@ -936,12 +925,12 @@ class OnlineFeatureEngineer:
             'log_ret': ret_log,
             
             # Microstructure & Math
-            'frac_diff': fd_price,          # NEW: Fractionally Differentiated Price
-            'micro_ofi': micro_ofi,         # NEW: Microstructure OFI
+            'frac_diff': fd_price,          # Fractionally Differentiated Price
+            'micro_ofi': micro_ofi_z,       # Z-Scored Flow Imbalance
             'entropy': entropy_val,
             'vpin': vpin_val,
             'hurst': hurst_val,
-            'ofi_simple': ofi_simple,       
+            'ofi_simple': ofi_simple,        
             'efficiency_ratio': er_val,
             
             # Context
@@ -949,6 +938,11 @@ class OnlineFeatureEngineer:
             'ofi_trend': ofi_trend,
             'regime': regime_val,
             'vol_breakout': vol_breakout,
+            
+            # MTF Context (NEW)
+            'd1_trend': d1_trend,
+            'h4_rsi': h4_rsi_norm,
+            'mtf_alignment': mtf_align,
             
             # Physics
             'body_ratio': body_ratio,
@@ -1130,6 +1124,7 @@ def calculate_hurst(ts):
     return max(0.0, min(1.0, hurst))
 
 def enrich_with_d1_data(features: Dict[str, float], d1_data: Dict[str, float], current_price: float) -> Dict[str, float]:
+    # Kept for backward compatibility, but core logic now in OnlineFeatureEngineer.update
     if not d1_data: return features
     
     prev_high = d1_data.get('high', 0)
