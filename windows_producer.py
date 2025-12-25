@@ -7,7 +7,8 @@
 # 1. Downloads Historical Data -> Postgres.
 # 2. Streams Live Ticks -> Redis.
 # 3. Executes Trades <- Redis.
-# 4. AUDIT REMEDIATION (2025-12-24):
+#
+# AUDIT REMEDIATION (2025-12-25):
 #    - A. Compliance: Strict Retry Loop for Risk State Reconstruction.
 #    - B. Zombie Defense: Strict TTL (3s) on trade signals.
 #    - C. Thread Safety: Global RLock for ALL MT5 calls.
@@ -15,8 +16,8 @@
 #    - E. Precision: Dynamic rounding for JPY/XAU before JSON serialization.
 #    - F. AUTO-DETECT: Updates Account Size from Broker to prevent false Liquidations.
 #
-# QUANT OVERHAUL (2025-12-25):
-#    - G. MICROSTRUCTURE: Added Level 2 (DOM) polling with TICK RULE FALLBACK.
+# QUANT OVERHAUL (RETAIL FALLBACK):
+#    - G. MICROSTRUCTURE: Robust Level 2 (DOM) polling with TICK RULE FALLBACK.
 # =============================================================================
 
 import os
@@ -593,12 +594,16 @@ class HybridProducer:
                 
                 # If we got valid data, return it
                 if bid_vol > 0 or ask_vol > 0:
-                    return bid_vol, ask_vol
+                    return float(bid_vol), float(ask_vol)
             
             # 2. Fallback: Tick Rule (Retail Estimation)
             # Logic: Compare current price to last price to assign volume direction
             last_price = self.last_prices.get(symbol, current_price)
             
+            # Default to neutral if no history
+            if last_price == 0: 
+                return current_vol / 2.0, current_vol / 2.0
+
             if current_price > last_price:
                 # Up Tick -> Aggressive Buyer -> Volume assigned to Bid
                 return float(current_vol), 0.0
@@ -611,6 +616,7 @@ class HybridProducer:
                 return half_vol, half_vol
             
         except Exception:
+            # Safe Fallback on crash
             return 0.0, 0.0
 
     def _tick_stream_loop(self):
@@ -647,15 +653,15 @@ class HybridProducer:
                         # Current tick volume (use volume_real if available, else tick_volume)
                         current_vol = float(tick.volume_real if tick.volume_real > 0 else tick.volume)
                         
+                        # Use Last price if available, else Mid
+                        price_now = tick.last if tick.last > 0 else (bid + ask) / 2.0
+                        
                         # --- MICROSTRUCTURE INGESTION (WITH FALLBACK) ---
                         # Poll L2 Data OR Estimate via Tick Rule
-                        bid_vol, ask_vol = self._get_l2_volumes(sym, bid, ask, current_vol, tick.last if tick.last > 0 else (bid+ask)/2)
+                        bid_vol, ask_vol = self._get_l2_volumes(sym, bid, ask, current_vol, price_now)
                         
                         # Update state for next tick comparison
-                        if tick.last > 0:
-                            self.last_prices[sym] = tick.last
-                        else:
-                            self.last_prices[sym] = (bid + ask) / 2
+                        self.last_prices[sym] = price_now
                         # --------------------------------
                         
                         self.cluster_engine.update_correlations(pd.DataFrame()) 
@@ -667,6 +673,7 @@ class HybridProducer:
                             "symbol": sym, "time": utc_ts, 
                             "bid": bid, 
                             "ask": ask, 
+                            "price": price_now, # Explicitly send price
                             "volume": current_vol,
                             "bid_vol": float(bid_vol), # NEW: Level 2 or Estimated Volume
                             "ask_vol": float(ask_vol), # NEW: Level 2 or Estimated Volume
