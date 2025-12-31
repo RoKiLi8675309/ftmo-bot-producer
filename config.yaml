@@ -1,12 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V6.1 (FORENSIC RECTIFICATION)
+# config.yaml – PROJECT PHOENIX V7.0 (AGGRESSOR BREAKOUT)
 # STATUS: CONFIGURABLE | TARGET: 10% IN 90 DAYS
 #
-# UPDATES (V6.1 - 2025-01-02):
-# 1. MEAN REVERSION HARDENING: Added 'aggressor_reversion_limit' & 'ker_reversion_max'.
-#    - Prevents "Knife Catching" (buying falling candles) and "Trend Fading" (shorting rallies).
-# 2. TREND TUNING: Relaxed KER entry to 0.15 to capture early momentum.
-# 3. RISK: Maintained strictly low risk (0.20%) to survive drawdowns.
+# STRATEGY UPDATE (V7.0):
+# 1. LOGIC: Pure Trend Aggressor. No Mean Reversion.
+# 2. GATES: KER > 0.30 (Efficiency), RVOL > 2.0 (Fuel).
+# 3. RISK: 1.5 ATR Hard Stop.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -125,14 +124,14 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 15 # Lowered slightly to allow earlier entry
+    threshold: 25 # Increased for stronger trend confirmation (Aggressor)
   
   cyclical_time: true
   session_awareness: true
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (V6.1) ---
+# --- PHOENIX STRATEGY PARAMETERS (V7.0 AGGRESSOR) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
   enable_regime_a_entries: true       
@@ -140,19 +139,11 @@ phoenix_strategy:
   require_h4_alignment: true        
   
   # --- FILTER THRESHOLDS ---
-  max_relative_volume: 5.0        
-  ker_trend_threshold: 0.15       # AGGRESSIVE: Lowered to 0.15 to allow more trend trades
-  vol_expansion_threshold: 1.5 
-  range_gate_atr_mult: 1.0        
-  volume_gate_ratio: 0.8          
-  aggressor_threshold: 0.52       
+  max_relative_volume: 6.0        # Cap raised to allow strong breakout volume
+  ker_trend_threshold: 0.30       # HARD GATE: High Efficiency only
+  volume_gate_ratio: 2.0          # HARD GATE: Fuel Gauge must be high
+  aggressor_threshold: 0.55       # Price Action confirmation
   ml_confirmation_threshold: 0.60 
-  
-  # --- V6.1: MEAN REVERSION GATES (THE FIX) ---
-  # Knife Catch Guard: Don't buy dip if candle closed < 20% from Low
-  aggressor_reversion_limit: 0.20 
-  # Trend Fading Guard: Don't fade trends if Efficiency > 0.60 (Freight Train)
-  ker_reversion_max: 0.60         
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -188,13 +179,13 @@ optimization_search_space:
     max: 0.95
   
   # Triple Barrier Method (Labeling) -> Defines Reward Target (TP)
-  # WIDENED FLOOR: Allow 1.0 to find "Base Hit" strategies
+  # TREND MODE: Higher R:R Targets
   tbm_barrier_width:
-    min: 1.0
-    max: 3.0
+    min: 2.0
+    max: 4.0
   tbm_horizon_minutes:
     min: 60
-    max: 180
+    max: 240
     step: 30
   tbm_drift_threshold:
     min: 1.0
@@ -212,7 +203,7 @@ risk_management:
   # --- SIZING METHOD: STRICT PROP FIRM MODE ---
   sizing_method: "fixed_risk"
   
-  # Default Risk Per Trade (LOWERED FOR SURVIVAL)
+  # Default Risk Per Trade (Can be overridden by WFO)
   base_risk_per_trade_percent: 0.20
   
   max_daily_loss_pct: 0.048       # 4.8% (FTMO Limit is 5% - Keep buffer)
@@ -222,21 +213,21 @@ risk_management:
   max_lot_size: 50.0 
   min_lot_size: 0.01
   
-  # PROJECT PHOENIX EXIT LOGIC
-  stop_loss_atr_mult: 1.5         # Standard Volatility Stop
+  # PROJECT PHOENIX V7.0 EXIT LOGIC
+  stop_loss_atr_mult: 1.5         # STRICT HARD STOP
   take_profit_atr_mult: 3.0       # Default Target (Overridden by Optimized TBM)
   
-  # TIER 1: BREAKEVEN (DISABLED)
+  # TIER 1: BREAKEVEN
   breakeven:
-    enabled: false        
-    activation_atr: 2.0  
+    enabled: true        
+    activation_atr: 1.5  
     profit_pips: 2.0      
   
-  # TIER 2: TRAILING STOP (DISABLED)
+  # TIER 2: TRAILING STOP
   trailing_stop:
-    enabled: false        
-    activation_atr: 2.5             
-    distance_atr: 2.0               
+    enabled: true        
+    activation_atr: 2.0           
+    distance_atr: 1.5               
     step_atr: 0.5                   
   
   risk_timezone: "Europe/Prague"
@@ -300,7 +291,7 @@ online_learning:
   
   tbm:
     horizon_minutes: 120      
-    barrier_width: 2.5        
+    barrier_width: 3.0        
     min_profit_pips: 10.0      
     drift_threshold: 1.5 
   
@@ -342,7 +333,7 @@ wfo:
   n_trials: 35
   train_years: 2
   test_months: 6
-  min_trades_optimization: 12 # LOWERED from 25 to stop false pruning
-  # --- RISK OPTIMIZATION (SURVIVAL MODE) ---
-  # Strict Range: 0.10% to 0.25%. High risk is BANNED.
+  min_trades_optimization: 12 
+  # --- RISK OPTIMIZATION (BUFFER BUILD) ---
+  # Start small, scale up. Safe range for Aggressor testing.
   risk_per_trade_options: [0.10, 0.15, 0.20, 0.25]
