@@ -8,21 +8,12 @@
 # 2. Streams Live Ticks -> Redis (Now with D1 & H4 Context).
 # 3. Executes Trades <- Redis (Now with Limit Order Execution).
 # 
-# AUDIT REMEDIATION (2025-12-25):
-# - A. Compliance: Strict Retry Loop for Risk State Reconstruction.
-# - B. Zombie Defense: Strict TTL (3s) on trade signals.
-# - C. Thread Safety: Global RLock for ALL MT5 calls.
-# - D. Infrastructure: Redis Exponential Backoff & File-Based Kill Switch.
-# - E. Precision: Dynamic rounding for JPY/XAU before JSON serialization.
-# - F. AUTO-DETECT: Updates Account Size from Broker to prevent false Liquidations.
-# 
-# PROJECT PHOENIX UPDATE:
-# - G. DATA INGESTION: Streams H4 Data (OHLC + RSI) alongside D1 Context.
-# - H. EXECUTION: Implements Passive Limit Orders.
-# - I. CLEANUP: Removed Market Book (L2) dependencies. Pure L1 Tick Rule.
-#
-# IMPLEMENTATION UPDATE (Rec 4):
-# - Adaptive TTL: Latency monitor dynamically adjusts signal expiry (3s-5s).
+# AUDIT REMEDIATION (2025-12-31):
+# - A. Path Safety: Added robust sys.path injection for 'shared' module visibility.
+# - B. Crash Logging: Global exception handler to capture startup failures.
+# - C. Zombie Defense: Strict TTL (3s) on trade signals.
+# - D. Thread Safety: Global RLock for ALL MT5 calls.
+# - E. Infrastructure: Redis Exponential Backoff & File-Based Kill Switch.
 # =============================================================================
 import os
 import sys
@@ -41,6 +32,12 @@ from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 
+# --- PATH SAFETY FIX ---
+# Ensure the current directory is in sys.path so 'shared' can be imported
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+
 # Third-Party Imports
 import pytz
 import numpy as np
@@ -58,16 +55,20 @@ except ImportError:
     sys.exit(1)
 
 # --- PROJECT IMPORTS (MODULAR) ---
-from shared import (
-    CONFIG,
-    setup_logging, LogSymbols,
-    get_redis_connection,
-    FTMORiskMonitor, RiskManager, TradeContext, SessionGuard,
-    NewsEventMonitor, FTMOComplianceGuard,
-    PrecisionGuard,
-    ClusterContextBuilder,
-    TimeFeatureTransformer
-)
+try:
+    from shared import (
+        CONFIG,
+        setup_logging, LogSymbols,
+        get_redis_connection,
+        FTMORiskMonitor, RiskManager, TradeContext, SessionGuard,
+        NewsEventMonitor, FTMOComplianceGuard,
+        PrecisionGuard,
+        ClusterContextBuilder,
+        TimeFeatureTransformer
+    )
+except ImportError as e:
+    print(f"CRITICAL: Failed to import 'shared' module. Ensure you are running from the project root.\nError: {e}")
+    sys.exit(1)
 
 # Initialize Logging
 setup_logging("WindowsProducer")
