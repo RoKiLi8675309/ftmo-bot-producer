@@ -1,11 +1,12 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V5.5 (AGGRESSIVE RECOVERY)
+# config.yaml – PROJECT PHOENIX V6.1 (FORENSIC RECTIFICATION)
 # STATUS: CONFIGURABLE | TARGET: 10% IN 90 DAYS
 #
-# UPDATES (2025-01-01):
-# 1. GATES: Lowered KER to 0.20 to increase trade frequency.
-# 2. OPTIMIZATION: Reduced min_trades to 12 to stop false pruning.
-# 3. RISK: Kept strictly low (0.1-0.25%) to survive drawdowns.
+# UPDATES (V6.1 - 2025-01-02):
+# 1. MEAN REVERSION HARDENING: Added 'aggressor_reversion_limit' & 'ker_reversion_max'.
+#    - Prevents "Knife Catching" (buying falling candles) and "Trend Fading" (shorting rallies).
+# 2. TREND TUNING: Relaxed KER entry to 0.15 to capture early momentum.
+# 3. RISK: Maintained strictly low risk (0.20%) to survive drawdowns.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -95,10 +96,10 @@ features:
   use_log_returns: true
   
   # Project Phoenix L1 Proxies
-  use_parkinson_vol: true     
+  use_parkinson_vol: true      
   use_amihud_liquidity: true 
-  use_relative_volume: true   
-  use_aggressor_ratio: true   
+  use_relative_volume: true    
+  use_aggressor_ratio: true    
   
   # Legacy / Context
   use_regime: true
@@ -124,28 +125,34 @@ features:
   # Regime Filter (ADX)
   adx:
     period: 14
-    threshold: 18 # Lowered slightly to allow earlier entry
+    threshold: 15 # Lowered slightly to allow earlier entry
   
   cyclical_time: true
   session_awareness: true
   cluster_context: true
   d1_context: true
 
-# --- PHOENIX STRATEGY PARAMETERS (DEFAULTS) ---
+# --- PHOENIX STRATEGY PARAMETERS (V6.1) ---
 phoenix_strategy:
   # --- STRUCTURAL GATES ---
-  enable_regime_a_entries: true      
-  require_d1_trend: true             
+  enable_regime_a_entries: true       
+  require_d1_trend: true              
   require_h4_alignment: true        
   
   # --- FILTER THRESHOLDS ---
-  max_relative_volume: 4.0        
-  ker_trend_threshold: 0.20       # AGGRESSIVE: Lowered from 0.30 to allow more trades
+  max_relative_volume: 5.0        
+  ker_trend_threshold: 0.15       # AGGRESSIVE: Lowered to 0.15 to allow more trend trades
   vol_expansion_threshold: 1.5 
   range_gate_atr_mult: 1.0        
-  volume_gate_ratio: 1.1          
-  aggressor_threshold: 0.55        
+  volume_gate_ratio: 0.8          
+  aggressor_threshold: 0.52       
   ml_confirmation_threshold: 0.60 
+  
+  # --- V6.1: MEAN REVERSION GATES (THE FIX) ---
+  # Knife Catch Guard: Don't buy dip if candle closed < 20% from Low
+  aggressor_reversion_limit: 0.20 
+  # Trend Fading Guard: Don't fade trends if Efficiency > 0.60 (Freight Train)
+  ker_reversion_max: 0.60         
   
   # Microstructure Filters (Proxies)
   vpin_bucket_size: 1000
@@ -205,7 +212,7 @@ risk_management:
   # --- SIZING METHOD: STRICT PROP FIRM MODE ---
   sizing_method: "fixed_risk"
   
-  # Default Risk Per Trade (LOWERED)
+  # Default Risk Per Trade (LOWERED FOR SURVIVAL)
   base_risk_per_trade_percent: 0.20
   
   max_daily_loss_pct: 0.048       # 4.8% (FTMO Limit is 5% - Keep buffer)
@@ -228,9 +235,9 @@ risk_management:
   # TIER 2: TRAILING STOP (DISABLED)
   trailing_stop:
     enabled: false        
-    activation_atr: 2.5            
-    distance_atr: 2.0              
-    step_atr: 0.5                  
+    activation_atr: 2.5             
+    distance_atr: 2.0               
+    step_atr: 0.5                   
   
   risk_timezone: "Europe/Prague"
   friday_entry_cutoff_hour: 16        # Stop entries at 16:00 Server Time
@@ -239,7 +246,7 @@ risk_management:
   commission_per_lot_rt: 5.0
   contract_size: 100000
   
-  max_trades_per_day: 10             
+  max_trades_per_day: 10              
   correlation_penalty_threshold: 0.85
   max_loss_usd: 5000.0
   hard_stop_equity_usd: 80000.0
