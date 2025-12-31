@@ -7,21 +7,23 @@
 # 1. Downloads Historical Data -> Postgres.
 # 2. Streams Live Ticks -> Redis (Now with D1 & H4 Context).
 # 3. Executes Trades <- Redis (Now with Limit Order Execution).
-#
+# 
 # AUDIT REMEDIATION (2025-12-25):
-#    - A. Compliance: Strict Retry Loop for Risk State Reconstruction.
-#    - B. Zombie Defense: Strict TTL (3s) on trade signals.
-#    - C. Thread Safety: Global RLock for ALL MT5 calls.
-#    - D. Infrastructure: Redis Exponential Backoff & File-Based Kill Switch.
-#    - E. Precision: Dynamic rounding for JPY/XAU before JSON serialization.
-#    - F. AUTO-DETECT: Updates Account Size from Broker to prevent false Liquidations.
-#
+# - A. Compliance: Strict Retry Loop for Risk State Reconstruction.
+# - B. Zombie Defense: Strict TTL (3s) on trade signals.
+# - C. Thread Safety: Global RLock for ALL MT5 calls.
+# - D. Infrastructure: Redis Exponential Backoff & File-Based Kill Switch.
+# - E. Precision: Dynamic rounding for JPY/XAU before JSON serialization.
+# - F. AUTO-DETECT: Updates Account Size from Broker to prevent false Liquidations.
+# 
 # PROJECT PHOENIX UPDATE:
-#    - G. DATA INGESTION: Streams H4 Data (OHLC + RSI) alongside D1 Context.
-#    - H. EXECUTION: Implements Passive Limit Orders.
-#    - I. CLEANUP: Removed Market Book (L2) dependencies. Pure L1 Tick Rule.
+# - G. DATA INGESTION: Streams H4 Data (OHLC + RSI) alongside D1 Context.
+# - H. EXECUTION: Implements Passive Limit Orders.
+# - I. CLEANUP: Removed Market Book (L2) dependencies. Pure L1 Tick Rule.
+#
+# IMPLEMENTATION UPDATE (Rec 4):
+# - Adaptive TTL: Latency monitor dynamically adjusts signal expiry (3s-5s).
 # =============================================================================
-
 import os
 import sys
 import time
@@ -34,7 +36,6 @@ import math
 import queue
 import gc
 import uuid
-
 from typing import Dict, Any, List, Optional, Set, Tuple, Union
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
@@ -78,7 +79,6 @@ STREAM_KEY = CONFIG['redis']['price_data_stream']
 TRADE_REQUEST_STREAM = CONFIG['redis']['trade_request_stream']
 MAGIC_NUMBER = CONFIG['trading']['magic_number']
 MIDNIGHT_BUFFER_MINUTES = 30
-MAX_LATENCY_SECONDS = 3.0 # AUDIT FIX: Tightened from 5.0s to 3.0s (Zombie Defense)
 KILL_SWITCH_FILE = "kill_switch.lock"
 
 # Execution Settings (Limit Order Offset)
@@ -93,6 +93,48 @@ except AttributeError:
     log.warning(f"Invalid timeframe '{TARGET_TF_STR}' in config. Defaulting to M5.")
     TIMEFRAME_MT5 = mt5.TIMEFRAME_M5
     TARGET_TF_STR = "M5"
+
+# --- REC 4: ADAPTIVE TTL MANAGER ---
+class AdaptiveTTLManager:
+    """
+    Monitors latency statistics to dynamically adjust trade signal Time-To-Live (TTL).
+    Uses a lightweight statistical proxy (EMA) instead of full River to keep Windows dependencies light.
+    
+    Logic:
+    - Stable Network (Low Jitter): Extend TTL to 5.0s (Reduce dropped signals).
+    - Unstable Network (High Jitter): Tighten TTL to 3.0s (Prevent zombie execution).
+    """
+    def __init__(self, base_ttl=3.0, max_ttl=5.0, alpha=0.1):
+        self.base_ttl = base_ttl
+        self.max_ttl = max_ttl
+        self.alpha = alpha
+        
+        # State
+        self.avg_latency = 0.5 # Assume 500ms start
+        self.latency_var = 0.0 # Variance
+        self.current_ttl = base_ttl
+        self.lock = threading.Lock()
+        
+    def update(self, latency: float):
+        with self.lock:
+            # Update EMA Mean
+            delta = latency - self.avg_latency
+            self.avg_latency += self.alpha * delta
+            
+            # Update EMA Variance (Approximate)
+            self.latency_var = (1 - self.alpha) * self.latency_var + self.alpha * (delta ** 2)
+            
+            # Decision Logic
+            # If latency is low (< 1s) and stable (std_dev < 0.5s), relax TTL
+            jitter = math.sqrt(self.latency_var)
+            
+            if self.avg_latency < 1.0 and jitter < 0.5:
+                self.current_ttl = self.max_ttl
+            else:
+                self.current_ttl = self.base_ttl
+
+    def get_ttl(self) -> float:
+        return self.current_ttl
 
 class MT5ExecutionEngine:
     """
@@ -155,6 +197,7 @@ class MT5ExecutionEngine:
                     if pos.comment == comment and pos.time_msc > cutoff_msc:
                         log.warning(f"IDEMPOTENCY: Found existing position {pos.ticket}.")
                         return {"retcode": mt5.TRADE_RETCODE_DONE, "order": pos.ticket, "price": pos.price_open}
+            
             orders = mt5.orders_get(symbol=symbol)
             if orders:
                 for order in orders:
@@ -200,7 +243,7 @@ class MT5ExecutionEngine:
                     request["action"] = mt5.TRADE_ACTION_PENDING
                 
                 # Set Time GTC (Managed by Zombie Monitor)
-                request["type_time"] = mt5.ORDER_TIME_GTC 
+                request["type_time"] = mt5.ORDER_TIME_GTC
             
             # Sanitize Price/Volume using PrecisionGuard
             if "price" in request:
@@ -252,7 +295,7 @@ class MT5ExecutionEngine:
                 log.info(f"LIMIT ORDER PLACED: {symbol} Ticket: {result.order} @ {request['price']}")
                 return result._asdict()
             elif result.retcode in [mt5.TRADE_RETCODE_REQUOTE, mt5.TRADE_RETCODE_CONNECTION, mt5.TRADE_RETCODE_PRICE_OFF]:
-                try: self.r.incr("broker:metric:requotes") 
+                try: self.r.incr("broker:metric:requotes")
                 except: pass
                 
                 log.warning(f"Recoverable Error ({result.retcode}). Retrying...")
@@ -300,7 +343,6 @@ class MT5ExecutionEngine:
                 "type_filling": mt5.ORDER_FILLING_IOC
             }
             result = mt5.order_send(request) # Helper calls execute_trade but here we call raw order_send to avoid recursion loops
-
             if result and result.retcode == mt5.TRADE_RETCODE_DONE:
                 time.sleep(0.2)
                 deals = mt5.history_deals_get(position=position_id)
@@ -314,7 +356,6 @@ class MT5ExecutionEngine:
                     except: pass
                 else:
                     log.warning(f"Trade Verification Failed: Could not retrieve history for {position_id}")
-
             return result
 
 class HybridProducer:
@@ -332,7 +373,7 @@ class HybridProducer:
         self.executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="ExecWorker")
         self.db_dsn = CONFIG['postgres']['dsn']
         self._connect_db_with_retry()
-
+        
         initial_bal = CONFIG.get('env', {}).get('initial_balance', 100000.0)
         self.ftmo_monitor = FTMORiskMonitor(
             initial_balance=initial_bal,
@@ -347,6 +388,9 @@ class HybridProducer:
         # Init Execution Engine AFTER MT5 is connected
         self.exec_engine = MT5ExecutionEngine(self.r, self.mt5_lock, self.ftmo_monitor)
         
+        # --- REC 4: ADAPTIVE TTL ---
+        self.ttl_manager = AdaptiveTTLManager()
+        
         self.session_guard = SessionGuard()
         self.news_monitor = NewsEventMonitor()
         self.compliance_guard = FTMOComplianceGuard([])
@@ -356,17 +400,16 @@ class HybridProducer:
         self.d1_cache = {p: {} for p in SYMBOLS}
         self.h4_cache = {p: {} for p in SYMBOLS} # QUANT UPGRADE: H4 Cache
         self.last_context_update = 0
-
         self.notified_tickets = set()
         
         # Track last prices for Tick Rule Fallback
         self.last_prices = {s: 0.0 for s in SYMBOLS}
-
+        
         self.run_precise_backfill()
         
         # AUDIT FIX: Retry-guarded Risk State Reconstruction
         self._reconstruct_risk_state_from_history()
-
+        
         self.monitored_symbols = self._ensure_conversion_pairs()
         self.monitored_price_keys = {s: f"price:{s}" for s in self.monitored_symbols}
 
@@ -409,7 +452,6 @@ class HybridProducer:
                 log.info(f"CPU Affinity set to P-Cores: {p_cores}")
             except Exception as e:
                 log.warning(f"Could not set CPU affinity: {e}")
-
         except Exception as e:
             log.warning(f"Process optimization failed: {e}")
 
@@ -425,7 +467,7 @@ class HybridProducer:
             login = mt5_conf.get('login')
             password = mt5_conf.get('password')
             server = mt5_conf.get('server')
-
+            
             # 2. Initialize
             init_params = {}
             if path and os.path.exists(path):
@@ -447,7 +489,7 @@ class HybridProducer:
                     sys.exit(1)
             else:
                 log.warning("MT5 Credentials missing in Config. Running in initialized mode only.")
-
+            
             # 4. Subscribe to Symbols
             for sym in SYMBOLS:
                 if not mt5.symbol_select(sym, True):
@@ -457,7 +499,7 @@ class HybridProducer:
 
     def _reconstruct_risk_state_from_history(self):
         """
-        AUDIT FIX: 
+        AUDIT FIX:
         1. Compliance Breach Prevention via Retry Loop.
         2. Blocks startup until Risk State is cryptographically verified (conceptually).
         3. AUTO-DETECT: Updates Account Size if Config mismatches Broker.
@@ -474,7 +516,7 @@ class HybridProducer:
                         time.sleep(2)
                         retry_count += 1
                         continue
-
+                    
                     info = mt5.account_info()
                     if not info:
                         log.warning(f"Failed to get Account Info. Retry {retry_count+1}...")
@@ -491,8 +533,9 @@ class HybridProducer:
                         log.warning(f"⚠️ Auto-Detecting Account Size: Config ({self.ftmo_monitor.initial_balance}) != Broker ({current_balance}). Updating Risk Limits.")
                         self.ftmo_monitor.initial_balance = current_balance
                         self.ftmo_monitor.max_daily_loss = current_balance * CONFIG['risk_management']['max_daily_loss_pct']
+                    
                     # --------------------------------------
-
+                    
                     # History Scan
                     now = datetime.now()
                     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -504,7 +547,7 @@ class HybridProducer:
                         retry_count += 1
                         time.sleep(2)
                         continue
-
+                    
                     realized_pnl_today = 0.0
                     for d in deals:
                         if d.magic == MAGIC_NUMBER:
@@ -519,7 +562,7 @@ class HybridProducer:
                     
                     log.info(f"{LogSymbols.SUCCESS} RISK STATE VERIFIED: Start Equity: {calculated_start:.2f} | Realized Today: {realized_pnl_today:.2f} | Account: {self.ftmo_monitor.initial_balance}")
                     return # Success
-
+            
             except Exception as e:
                 log.error(f"Risk Reconstruction Exception: {e}")
                 retry_count += 1
@@ -537,17 +580,20 @@ class HybridProducer:
             start_dt = datetime.strptime(start_str, "%Y-%m-%d")
             utc_from = pytz.utc.localize(start_dt)
             utc_now = datetime.now(pytz.utc)
+            
             chunk_days = 30
             current_start = utc_from
-
+            
             while current_start < utc_now:
                 current_end = current_start + timedelta(days=chunk_days)
                 if current_end > utc_now: current_end = utc_now
+                
                 with self.db_cursor() as cur:
                     for sym in SYMBOLS:
                         with self.mt5_lock:
                             rates = mt5.copy_rates_range(sym, TIMEFRAME_MT5, current_start, current_end)
                             if rates is None or len(rates) == 0: continue
+                            
                             data_tuples = []
                             for r in rates:
                                 try:
@@ -560,12 +606,14 @@ class HybridProducer:
                                         int(r['tick_volume'])
                                     ))
                                 except: continue
+                            
                             if data_tuples:
                                 execute_values(cur, """
                                     INSERT INTO ohlcv (time, symbol, timeframe, open, high, low, close, volume)
                                     VALUES %s
                                     ON CONFLICT (time, symbol, timeframe) DO NOTHING
                                 """, data_tuples)
+                
                 current_start = current_end
                 gc.collect()
             log.info(f"{LogSymbols.SUCCESS} Data Backfill Complete.")
@@ -596,10 +644,12 @@ class HybridProducer:
             account_info = mt5.account_info()
             if not account_info: return monitored
             acc_ccy = account_info.currency
+            
             for sym in SYMBOLS:
                 info = mt5.symbol_info(sym)
                 if not info: continue
                 profit_ccy = info.currency_profit
+                
                 if profit_ccy != acc_ccy:
                     candidates = [f"{profit_ccy}{acc_ccy}", f"{acc_ccy}{profit_ccy}"]
                     for c in candidates:
@@ -618,9 +668,9 @@ class HybridProducer:
             last_price = self.last_prices.get(symbol, current_price)
             
             # Default to neutral if no history
-            if last_price == 0: 
+            if last_price == 0:
                 return current_vol / 2.0, current_vol / 2.0
-
+                
             if current_price > last_price:
                 # Up Tick -> Aggressive Buyer -> Volume assigned to Bid
                 return float(current_vol), 0.0
@@ -647,7 +697,7 @@ class HybridProducer:
                 log.critical("💀 KILL SWITCH DETECTED. SHUTTING DOWN IMMEDIATELY.")
                 with self.mt5_lock: mt5.shutdown()
                 sys.exit(0)
-
+                
             start = time.time()
             try:
                 # QUANT UPGRADE: Update D1 and H4 Context periodically
@@ -683,16 +733,16 @@ class HybridProducer:
                         self.last_prices[sym] = price_now
                         # --------------------------------
                         
-                        self.cluster_engine.update_correlations(pd.DataFrame()) 
+                        self.cluster_engine.update_correlations(pd.DataFrame())
                         
                         utc_ts = int(tick.time_msc) - int(self.exec_engine.broker_time_offset * 1000)
                         
                         # QUANT UPGRADE: Include H4 and D1 Context in Payload
                         payload = {
-                            "symbol": sym, "time": utc_ts, 
-                            "bid": bid, 
-                            "ask": ask, 
-                            "price": price_now, 
+                            "symbol": sym, "time": utc_ts,
+                            "bid": bid,
+                            "ask": ask,
+                            "price": price_now,
                             "volume": current_vol,
                             "bid_vol": float(bid_vol),
                             "ask_vol": float(ask_vol),
@@ -708,7 +758,6 @@ class HybridProducer:
                 pipe.execute()
                 self.r.setex(CONFIG['redis']['heartbeat_key'], 10, str(time.time()))
                 redis_failures = 0 # Reset on success
-
             except (redis.ConnectionError, redis.TimeoutError) as e:
                 # AUDIT FIX: Exponential Backoff for Redis
                 redis_failures += 1
@@ -734,7 +783,7 @@ class HybridProducer:
                         weights /= weights.sum()
                         ema = np.convolve(closes, weights, mode='valid')[0]
                     self.d1_cache[sym] = {
-                        'open': float(r['open']), 'high': float(r['high']), 
+                        'open': float(r['open']), 'high': float(r['high']),
                         'low': float(r['low']), 'close': float(r['close']),
                         'ema200': float(ema)
                     }
@@ -762,7 +811,6 @@ class HybridProducer:
                     current_rsi = rsi.iloc[-1]
                     
                     if np.isnan(current_rsi): current_rsi = 50.0
-
                     self.h4_cache[sym] = {
                         'open': float(r['open']),
                         'high': float(r['high']),
@@ -782,7 +830,6 @@ class HybridProducer:
                 # Trim request stream periodically
                 if int(time.time()) % 60 == 0:
                     self.r.xtrim(TRADE_REQUEST_STREAM, maxlen=1000, approximate=True)
-
                 entries = self.r.xreadgroup("execution_group", "producer_main", {TRADE_REQUEST_STREAM: '>'}, count=5, block=1000)
                 redis_failures = 0 # Reset on success
                 
@@ -807,8 +854,8 @@ class HybridProducer:
             action = data['action']
             uuid_val = data.get('uuid')
             
-            # --- AUDIT FIX: STRICT ZOMBIE TRADE PROTECTION ---
-            # Enforce strict TTL. If the signal is older than MAX_LATENCY_SECONDS, drop it.
+            # --- REC 4: ADAPTIVE TTL IMPLEMENTATION ---
+            # Parse timestamp and update Latency Monitor
             request_ts_str = data.get('timestamp')
             
             if request_ts_str:
@@ -817,13 +864,17 @@ class HybridProducer:
                     now_ts = time.time()
                     latency = now_ts - request_ts
                     
-                    if latency > MAX_LATENCY_SECONDS:
-                        log.error(f"🧟 ZOMBIE TRADE DROPPED: {symbol} Lag: {latency:.2f}s > {MAX_LATENCY_SECONDS}s")
+                    # Update statistical model
+                    self.ttl_manager.update(latency)
+                    current_ttl = self.ttl_manager.get_ttl()
+                    
+                    if latency > current_ttl:
+                        log.error(f"🧟 ZOMBIE TRADE DROPPED: {symbol} Lag: {latency:.2f}s > {current_ttl:.1f}s")
                         self.r.xack(TRADE_REQUEST_STREAM, "execution_group", msg_id)
                         return # ACK and DROP
                 except ValueError:
                     log.error(f"Invalid timestamp: {request_ts_str}")
-            # ------------------------------------------------
+            # ---------------------------------------------
 
             if uuid_val:
                 if self.r.sismember("processed_signals", uuid_val):
@@ -844,7 +895,7 @@ class HybridProducer:
                             return
                 self.exec_engine.execute_trade({
                     "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol,
-                    "volume": float(data['volume']), 
+                    "volume": float(data['volume']),
                     "type": mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL,
                     "sl": float(data.get("stop_loss", 0)), "tp": float(data.get("take_profit", 0)),
                     "magic": MAGIC_NUMBER, "comment": data.get("comment", "Algo")
@@ -856,6 +907,7 @@ class HybridProducer:
                 })
             elif action == "CLOSE_ALL":
                 self._close_all_positions(symbol)
+                
             self.r.xack(TRADE_REQUEST_STREAM, "execution_group", msg_id)
         except Exception as e:
             log.error(f"Trade Execution Error: {e}")
@@ -864,7 +916,6 @@ class HybridProducer:
         with self.mt5_lock:
             positions = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
             if not positions: return
-
             for p in positions:
                 if p.magic != MAGIC_NUMBER: continue
                 self.exec_engine.close_position(p.ticket, p.symbol, p.volume, p.type)
@@ -888,15 +939,15 @@ class HybridProducer:
                         if not self.ftmo_monitor.can_trade():
                             log.critical("RISK BREACH DETECTED IN SYNC LOOP. ATTEMPTING LIQUIDATION.")
                             self._close_all_positions()
-
+                    
                     pos_list = []
                     if positions:
                         for p in positions:
                             if p.magic == MAGIC_NUMBER:
                                 pos_list.append({
-                                    "ticket": p.ticket, "symbol": p.symbol, 
+                                    "ticket": p.ticket, "symbol": p.symbol,
                                     "type": "BUY" if p.type == mt5.ORDER_TYPE_BUY else "SELL",
-                                    "volume": p.volume, "entry_price": p.price_open, 
+                                    "volume": p.volume, "entry_price": p.price_open,
                                     "profit": p.profit, "sl": p.sl, "tp": p.tp
                                 })
                     key = f"{CONFIG['redis']['position_state_key_prefix']}:{MAGIC_NUMBER}"
@@ -924,7 +975,7 @@ class HybridProducer:
         freeze_key = CONFIG['redis']['risk_keys']['midnight_freeze']
         tz_name = CONFIG['risk_management'].get('risk_timezone', 'Europe/Prague')
         risk_tz = pytz.timezone(tz_name)
-
+        
         while self.running and not self.stop_event.is_set():
             now = datetime.now(timezone.utc).replace(tzinfo=timezone.utc).astimezone(risk_tz)
             if (now.hour == 23 and now.minute >= 55) or (now.hour == 0 and now.minute <= 5):
@@ -1011,7 +1062,9 @@ class HybridProducer:
             threading.Thread(target=self._pending_order_monitor, daemon=True)
         ]
         for t in threads: t.start()
+        
         log.info(f"{LogSymbols.ONLINE} Windows Producer Running. Risk State: {self.ftmo_monitor.starting_equity_of_day}")
+        
         try:
             while self.running:
                 try:
