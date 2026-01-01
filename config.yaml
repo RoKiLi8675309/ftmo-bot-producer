@@ -334,6 +334,6 @@ wfo:
   train_years: 2
   test_months: 6
   min_trades_optimization: 12 
-  # --- RISK OPTIMIZATION (BUFFER BUILD) ---
-  # Start small, scale up. Safe range for Aggressor testing.
-  risk_per_trade_options: [0.25, 0.50, 0.75, 1.00]
+  # --- RISK OPTIMIZATION (PROFIT MODE) ---
+  # Expanded range to allow Aggressor logic to size up to 1.0% for strong setups.
+  risk_per_trade_options: [0.25, 0.50, 0.75, 1.0]
