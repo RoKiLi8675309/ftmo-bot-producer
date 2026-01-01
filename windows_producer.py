@@ -7,7 +7,8 @@
 # 1. Downloads Historical Data -> Postgres.
 # 2. Streams Live Ticks -> Redis (Now with D1 & H4 Context).
 # 3. Executes Trades <- Redis (Now with Limit Order Execution).
-# 
+# 4. Publishes Closed Trades -> Redis (For SQN Calculation).
+#
 # AUDIT REMEDIATION (2025-12-31):
 # - A. Path Safety: Added robust sys.path injection for 'shared' module visibility.
 # - B. Crash Logging: Global exception handler to capture startup failures.
@@ -78,6 +79,7 @@ log = logging.getLogger("Producer")
 SYMBOLS = CONFIG['trading']['symbols']
 STREAM_KEY = CONFIG['redis']['price_data_stream']
 TRADE_REQUEST_STREAM = CONFIG['redis']['trade_request_stream']
+CLOSED_TRADE_STREAM = CONFIG['redis'].get('closed_trade_stream_key', 'stream:closed_trades')
 MAGIC_NUMBER = CONFIG['trading']['magic_number']
 MIDNIGHT_BUFFER_MINUTES = 30
 KILL_SWITCH_FILE = "kill_switch.lock"
@@ -343,20 +345,8 @@ class MT5ExecutionEngine:
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": mt5.ORDER_FILLING_IOC
             }
-            result = mt5.order_send(request) # Helper calls execute_trade but here we call raw order_send to avoid recursion loops
-            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                time.sleep(0.2)
-                deals = mt5.history_deals_get(position=position_id)
-                if deals:
-                    profit = sum(d.profit + d.swap + d.commission for d in deals)
-                    key = "risk:stats:wins" if profit > 0 else "risk:stats:losses"
-                    try:
-                        self.r.lpush(key, profit)
-                        self.r.ltrim(key, 0, 99)
-                        log.info(f"{LogSymbols.PROFIT if profit > 0 else LogSymbols.LOSS} Trade Closed. PnL: {profit:.2f}. Stats Updated.")
-                    except: pass
-                else:
-                    log.warning(f"Trade Verification Failed: Could not retrieve history for {position_id}")
+            result = mt5.order_send(request)
+            # PnL logic moved to _closed_trade_monitor for global coverage
             return result
 
 class HybridProducer:
@@ -405,6 +395,9 @@ class HybridProducer:
         
         # Track last prices for Tick Rule Fallback
         self.last_prices = {s: 0.0 for s in SYMBOLS}
+        
+        # State for Closed Trade Monitor
+        self.last_deal_scan_time = datetime.now() - timedelta(minutes=1)
         
         self.run_precise_backfill()
         
@@ -528,14 +521,10 @@ class HybridProducer:
                     current_balance = info.balance
                     
                     # --- AUTO DETECT ACCOUNT SIZE (FIX) ---
-                    # If config mismatches broker by > 1%, assume config is generic
-                    # and adopt the broker's balance as the "Initial Balance" for FTMO limits.
                     if abs(self.ftmo_monitor.initial_balance - current_balance) > (current_balance * 0.01):
                         log.warning(f"⚠️ Auto-Detecting Account Size: Config ({self.ftmo_monitor.initial_balance}) != Broker ({current_balance}). Updating Risk Limits.")
                         self.ftmo_monitor.initial_balance = current_balance
                         self.ftmo_monitor.max_daily_loss = current_balance * CONFIG['risk_management']['max_daily_loss_pct']
-                    
-                    # --------------------------------------
                     
                     # History Scan
                     now = datetime.now()
@@ -543,7 +532,6 @@ class HybridProducer:
                     deals = mt5.history_deals_get(midnight, now)
                     
                     if deals is None:
-                        # AUDIT: Deals is None indicates API failure/Timeout. Do NOT assume 0.
                         log.error(f"MT5 History API returned None (Audit Fail). Retry {retry_count+1}...")
                         retry_count += 1
                         time.sleep(2)
@@ -556,10 +544,10 @@ class HybridProducer:
                     
                     calculated_start = current_balance - realized_pnl_today
                     
-                    # Apply & Broadcast to Redis for Linux Engine
+                    # Apply & Broadcast
                     self.ftmo_monitor.starting_equity_of_day = calculated_start
                     self.r.set(CONFIG['redis']['risk_keys']['daily_starting_equity'], calculated_start)
-                    self.r.set("bot:account_size", self.ftmo_monitor.initial_balance) # Broadcast Account Size
+                    self.r.set("bot:account_size", self.ftmo_monitor.initial_balance) 
                     
                     log.info(f"{LogSymbols.SUCCESS} RISK STATE VERIFIED: Start Equity: {calculated_start:.2f} | Realized Today: {realized_pnl_today:.2f} | Account: {self.ftmo_monitor.initial_balance}")
                     return # Success
@@ -569,7 +557,6 @@ class HybridProducer:
                 retry_count += 1
                 time.sleep(2)
         
-        # If we reach here, we failed to verify risk state.
         log.critical("CRITICAL: FAILED TO VERIFY RISK STATE AFTER 5 ATTEMPTS. ABORTING STARTUP TO PREVENT COMPLIANCE BREACH.")
         sys.exit(1)
 
@@ -714,13 +701,12 @@ class HybridProducer:
                         if not tick: continue
                         
                         # AUDIT FIX: JPY Precision for Serialization
-                        # Round to symbol digits to prevent 145.230000004 artifacts
                         sym_info = mt5.symbol_info(sym)
                         digits = sym_info.digits if sym_info else 5
                         bid = round(tick.bid, digits)
                         ask = round(tick.ask, digits)
                         
-                        # Current tick volume (use volume_real if available, else tick_volume)
+                        # Current tick volume
                         current_vol = float(tick.volume_real if tick.volume_real > 0 else tick.volume)
                         
                         # Use Last price if available, else Mid
@@ -921,6 +907,57 @@ class HybridProducer:
                 if p.magic != MAGIC_NUMBER: continue
                 self.exec_engine.close_position(p.ticket, p.symbol, p.volume, p.type)
 
+    def _closed_trade_monitor(self):
+        """
+        NEW: Polls MT5 for closed trades and publishes them to Redis Stream.
+        Critical for Linux Engine's SQN Calculation.
+        """
+        log.info("Starting Closed Trade Monitor (SQN Feed)...")
+        # Use simple tracking, assume we only care about trades closed while running
+        # or just query last few minutes.
+        while self.running and not self.stop_event.is_set():
+            try:
+                now = datetime.now()
+                # Query window: From last scan time to now
+                with self.mt5_lock:
+                    deals = mt5.history_deals_get(self.last_deal_scan_time, now)
+                
+                self.last_deal_scan_time = now # Update cursor
+                
+                if deals:
+                    pipe = self.r.pipeline()
+                    published_count = 0
+                    
+                    for deal in deals:
+                        # Filter by Magic Number and Entry type (OUT or IN/OUT)
+                        if deal.magic == MAGIC_NUMBER and deal.entry in [mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT]:
+                            # Calculate net profit for this deal
+                            # Note: In hedging, a deal closes a specific position.
+                            net_pnl = deal.profit + deal.swap + deal.commission
+                            
+                            payload = {
+                                "symbol": deal.symbol,
+                                "ticket": deal.ticket,
+                                "position_id": deal.position_id,
+                                "net_pnl": float(net_pnl),
+                                "close_price": deal.price,
+                                "reason": deal.reason,
+                                "timestamp": deal.time
+                            }
+                            
+                            # Publish to Stream
+                            pipe.xadd(CLOSED_TRADE_STREAM, payload, maxlen=1000, approximate=True)
+                            published_count += 1
+                            
+                    if published_count > 0:
+                        pipe.execute()
+                        log.info(f"📊 Published {published_count} Closed Trades to {CLOSED_TRADE_STREAM}")
+            
+            except Exception as e:
+                log.error(f"Closed Trade Monitor Error: {e}")
+                
+            time.sleep(5) # Poll every 5s
+
     def _sync_positions(self):
         while self.running:
             try:
@@ -1060,7 +1097,8 @@ class HybridProducer:
             threading.Thread(target=self._sync_positions, daemon=True),
             threading.Thread(target=self._candle_sync_loop, daemon=True),
             threading.Thread(target=self._midnight_watchman_loop, daemon=True),
-            threading.Thread(target=self._pending_order_monitor, daemon=True)
+            threading.Thread(target=self._pending_order_monitor, daemon=True),
+            threading.Thread(target=self._closed_trade_monitor, daemon=True) # NEW: SQN Feed
         ]
         for t in threads: t.start()
         
