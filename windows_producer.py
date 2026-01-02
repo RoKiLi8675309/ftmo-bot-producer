@@ -5,16 +5,14 @@
 # DESCRIPTION:
 # The Gateway to the Market.
 # 1. Downloads Historical Data -> Postgres.
-# 2. Streams Live Ticks -> Redis (Now with D1 & H4 Context).
-# 3. Executes Trades <- Redis (Now with Limit Order Execution).
-# 4. Publishes Closed Trades -> Redis (For SQN Calculation).
+# 2. Streams Live Ticks -> Redis.
+# 3. Executes Trades <- Redis (Limit Orders).
+# 4. Publishes Closed Trades -> Redis (Critical for V10.0 Circuit Breaker).
 #
-# AUDIT REMEDIATION (2025-12-31):
-# - A. Path Safety: Added robust sys.path injection for 'shared' module visibility.
-# - B. Crash Logging: Global exception handler to capture startup failures.
-# - C. Zombie Defense: Strict TTL (3s) on trade signals.
-# - D. Thread Safety: Global RLock for ALL MT5 calls.
-# - E. Infrastructure: Redis Exponential Backoff & File-Based Kill Switch.
+# PHOENIX V10.0 UPGRADES:
+# - D1 CONTEXT: Upgraded EMA 200 calculation (Fetch 500 bars + Pandas EWM).
+# - H4 CONTEXT: Upgraded RSI 14 calculation (Wilder's Smoothing).
+# - COMPLIANCE: Validated 'stream:closed_trades' feed for Engine Circuit Breaker.
 # =============================================================================
 import os
 import sys
@@ -97,15 +95,10 @@ except AttributeError:
     TIMEFRAME_MT5 = mt5.TIMEFRAME_M5
     TARGET_TF_STR = "M5"
 
-# --- REC 4: ADAPTIVE TTL MANAGER ---
+# --- ADAPTIVE TTL MANAGER ---
 class AdaptiveTTLManager:
     """
     Monitors latency statistics to dynamically adjust trade signal Time-To-Live (TTL).
-    Uses a lightweight statistical proxy (EMA) instead of full River to keep Windows dependencies light.
-    
-    Logic:
-    - Stable Network (Low Jitter): Extend TTL to 5.0s (Reduce dropped signals).
-    - Unstable Network (High Jitter): Tighten TTL to 3.0s (Prevent zombie execution).
     """
     def __init__(self, base_ttl=3.0, max_ttl=5.0, alpha=0.1):
         self.base_ttl = base_ttl
@@ -120,17 +113,11 @@ class AdaptiveTTLManager:
         
     def update(self, latency: float):
         with self.lock:
-            # Update EMA Mean
             delta = latency - self.avg_latency
             self.avg_latency += self.alpha * delta
-            
-            # Update EMA Variance (Approximate)
             self.latency_var = (1 - self.alpha) * self.latency_var + self.alpha * (delta ** 2)
             
-            # Decision Logic
-            # If latency is low (< 1s) and stable (std_dev < 0.5s), relax TTL
             jitter = math.sqrt(self.latency_var)
-            
             if self.avg_latency < 1.0 and jitter < 0.5:
                 self.current_ttl = self.max_ttl
             else:
@@ -143,8 +130,6 @@ class MT5ExecutionEngine:
     """
     Robust Execution Engine.
     Handles Idempotency, Retries, Broker Constraints, and Metrics.
-    AUDIT FIX: All MT5 calls guarded by self.lock (Re-entrant).
-    QUANT UPGRADE: Switches from Market to Limit Orders for Spread Capture.
     """
     def __init__(self, redis_client, lock: threading.RLock, risk_monitor: FTMORiskMonitor):
         self.lock = lock
@@ -153,9 +138,6 @@ class MT5ExecutionEngine:
         self.r = redis_client
         self.risk_monitor = risk_monitor
         self.broker_time_offset = 0.0
-        
-        # Initial connection check is handled by the main producer class
-        # We assume mt5 is initialized when this engine is used
         
         if not self._calculate_broker_offset_robust():
             log.critical("CRITICAL: Timezone Sync Failed. Aborting startup.")
@@ -210,19 +192,12 @@ class MT5ExecutionEngine:
         return None
 
     def execute_trade(self, request: Dict[str, Any], max_retries: int = 3) -> Optional[Dict[str, Any]]:
-        """
-        Executes a trade request using Limit Orders to capture spread.
-        """
         symbol = request.get("symbol")
         if not symbol: return None
         
-        # 1. Pre-Flight Checks
         symbol_info = self._get_symbol_info(symbol)
         if not symbol_info: return None
         
-        # QUANT UPGRADE: Calculate Limit Price
-        # Buy Limit @ Bid - Offset
-        # Sell Limit @ Ask + Offset
         try:
             with self.lock:
                 tick = mt5.symbol_info_tick(symbol)
@@ -230,7 +205,6 @@ class MT5ExecutionEngine:
             
             pip_size = symbol_info.point * 10 if symbol_info.digits == 3 or symbol_info.digits == 5 else symbol_info.point
             
-            # Logic Branch: If it's a DEAL action (Entry), convert to LIMIT
             if request["action"] == mt5.TRADE_ACTION_DEAL:
                 offset_val = LIMIT_OFFSET_PIPS * pip_size
                 
@@ -245,14 +219,11 @@ class MT5ExecutionEngine:
                     request["price"] = limit_price
                     request["action"] = mt5.TRADE_ACTION_PENDING
                 
-                # Set Time GTC (Managed by Zombie Monitor)
                 request["type_time"] = mt5.ORDER_TIME_GTC
             
-            # Sanitize Price/Volume using PrecisionGuard
             if "price" in request:
                 request["price"] = PrecisionGuard.normalize_price(request["price"], symbol, symbol_info)
             
-            # Normalize Volume
             raw_vol = float(request["volume"])
             vol_step = symbol_info.volume_step
             if vol_step > 0:
@@ -261,13 +232,11 @@ class MT5ExecutionEngine:
             request["volume"] = max(symbol_info.volume_min, min(request["volume"], symbol_info.volume_max))
             request["volume"] = round(request["volume"], 2)
 
-            # Sanitize SL/TP
             if "sl" in request and float(request["sl"]) > 0:
                 request["sl"] = PrecisionGuard.normalize_price(float(request["sl"]), symbol, symbol_info)
             if "tp" in request and float(request["tp"]) > 0:
                 request["tp"] = PrecisionGuard.normalize_price(float(request["tp"]), symbol, symbol_info)
             
-            # Filling Mode
             filling = symbol_info.filling_mode
             if filling & mt5.SYMBOL_FILLING_FOK:
                 request["type_filling"] = mt5.ORDER_FILLING_FOK
@@ -280,7 +249,6 @@ class MT5ExecutionEngine:
             log.error(f"Sanitization error for {symbol}: {e}")
             return None
 
-        # 2. Execution Loop
         for attempt in range(max_retries):
             with self.lock:
                 result = mt5.order_send(request)
@@ -304,7 +272,6 @@ class MT5ExecutionEngine:
                 log.warning(f"Recoverable Error ({result.retcode}). Retrying...")
                 time.sleep(0.5 * (2 ** attempt))
                 
-                # Refresh Price for Limit Order if necessary (Adaptive Limit)
                 if request["action"] == mt5.TRADE_ACTION_PENDING:
                     with self.lock:
                         tick = mt5.symbol_info_tick(symbol)
@@ -346,7 +313,6 @@ class MT5ExecutionEngine:
                 "type_filling": mt5.ORDER_FILLING_IOC
             }
             result = mt5.order_send(request)
-            # PnL logic moved to _closed_trade_monitor for global coverage
             return result
 
 class HybridProducer:
@@ -359,7 +325,7 @@ class HybridProducer:
             db=0,
             decode_responses=True
         )
-        self.mt5_lock = threading.RLock() # AUDIT FIX: Global RLock for MT5
+        self.mt5_lock = threading.RLock()
         self.execution_queue = queue.Queue()
         self.executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="ExecWorker")
         self.db_dsn = CONFIG['postgres']['dsn']
@@ -372,14 +338,9 @@ class HybridProducer:
             redis_client=self.r
         )
         
-        # Initialization Sequence
         self._optimize_process()
-        self.connect_mt5() # Explicit MT5 Connection using Config
-        
-        # Init Execution Engine AFTER MT5 is connected
+        self.connect_mt5()
         self.exec_engine = MT5ExecutionEngine(self.r, self.mt5_lock, self.ftmo_monitor)
-        
-        # --- REC 4: ADAPTIVE TTL ---
         self.ttl_manager = AdaptiveTTLManager()
         
         self.session_guard = SessionGuard()
@@ -389,19 +350,14 @@ class HybridProducer:
         self.time_engine = TimeFeatureTransformer()
         self.cluster_engine = ClusterContextBuilder(SYMBOLS)
         self.d1_cache = {p: {} for p in SYMBOLS}
-        self.h4_cache = {p: {} for p in SYMBOLS} # QUANT UPGRADE: H4 Cache
+        self.h4_cache = {p: {} for p in SYMBOLS} 
         self.last_context_update = 0
         self.notified_tickets = set()
         
-        # Track last prices for Tick Rule Fallback
         self.last_prices = {s: 0.0 for s in SYMBOLS}
-        
-        # State for Closed Trade Monitor
         self.last_deal_scan_time = datetime.now() - timedelta(minutes=1)
         
         self.run_precise_backfill()
-        
-        # AUDIT FIX: Retry-guarded Risk State Reconstruction
         self._reconstruct_risk_state_from_history()
         
         self.monitored_symbols = self._ensure_conversion_pairs()
@@ -432,14 +388,9 @@ class HybridProducer:
             yield self.conn.cursor()
 
     def _optimize_process(self):
-        """
-        AUDIT FIX: P-Core Pinning (0-15 for i7-13700K)
-        """
         try:
             proc = psutil.Process(os.getpid())
             proc.nice(psutil.HIGH_PRIORITY_CLASS)
-            
-            # 8 P-Cores x 2 Threads = Indices 0-15
             p_cores = list(range(16))
             try:
                 proc.cpu_affinity(p_cores)
@@ -450,19 +401,13 @@ class HybridProducer:
             log.warning(f"Process optimization failed: {e}")
 
     def connect_mt5(self):
-        """
-        Initializes MT5 with robust path handling from Config.
-        Project Phoenix: Pure L1 Data (No Market Book).
-        """
         with self.mt5_lock:
-            # 1. Retrieve Creds
             mt5_conf = CONFIG.get('mt5', {})
             path = mt5_conf.get('path')
             login = mt5_conf.get('login')
             password = mt5_conf.get('password')
             server = mt5_conf.get('server')
             
-            # 2. Initialize
             init_params = {}
             if path and os.path.exists(path):
                 init_params['path'] = path
@@ -471,7 +416,6 @@ class HybridProducer:
                 log.critical(f"MT5 Initialize Failed: {mt5.last_error()}")
                 sys.exit(1)
             
-            # 3. Login (if credentials provided)
             if login and password and server:
                 try:
                     if not mt5.login(login=int(login), password=password, server=server):
@@ -484,7 +428,6 @@ class HybridProducer:
             else:
                 log.warning("MT5 Credentials missing in Config. Running in initialized mode only.")
             
-            # 4. Subscribe to Symbols
             for sym in SYMBOLS:
                 if not mt5.symbol_select(sym, True):
                     log.error(f"Failed to select symbol {sym}")
@@ -492,12 +435,6 @@ class HybridProducer:
                     log.info(f"Subscribed to {sym} (L1 Mode)")
 
     def _reconstruct_risk_state_from_history(self):
-        """
-        AUDIT FIX:
-        1. Compliance Breach Prevention via Retry Loop.
-        2. Blocks startup until Risk State is cryptographically verified (conceptually).
-        3. AUTO-DETECT: Updates Account Size if Config mismatches Broker.
-        """
         log.info("Reconstructing Risk State (FTMO Compliance)...")
         retry_count = 0
         max_retries = 5
@@ -520,13 +457,11 @@ class HybridProducer:
                     
                     current_balance = info.balance
                     
-                    # --- AUTO DETECT ACCOUNT SIZE (FIX) ---
                     if abs(self.ftmo_monitor.initial_balance - current_balance) > (current_balance * 0.01):
                         log.warning(f"⚠️ Auto-Detecting Account Size: Config ({self.ftmo_monitor.initial_balance}) != Broker ({current_balance}). Updating Risk Limits.")
                         self.ftmo_monitor.initial_balance = current_balance
                         self.ftmo_monitor.max_daily_loss = current_balance * CONFIG['risk_management']['max_daily_loss_pct']
                     
-                    # History Scan
                     now = datetime.now()
                     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
                     deals = mt5.history_deals_get(midnight, now)
@@ -543,14 +478,12 @@ class HybridProducer:
                             realized_pnl_today += (d.profit + d.swap + d.commission)
                     
                     calculated_start = current_balance - realized_pnl_today
-                    
-                    # Apply & Broadcast
                     self.ftmo_monitor.starting_equity_of_day = calculated_start
                     self.r.set(CONFIG['redis']['risk_keys']['daily_starting_equity'], calculated_start)
                     self.r.set("bot:account_size", self.ftmo_monitor.initial_balance) 
                     
                     log.info(f"{LogSymbols.SUCCESS} RISK STATE VERIFIED: Start Equity: {calculated_start:.2f} | Realized Today: {realized_pnl_today:.2f} | Account: {self.ftmo_monitor.initial_balance}")
-                    return # Success
+                    return
             
             except Exception as e:
                 log.error(f"Risk Reconstruction Exception: {e}")
@@ -647,31 +580,19 @@ class HybridProducer:
         return monitored
 
     def _estimate_flow_volumes(self, symbol: str, current_vol: float, current_price: float) -> Tuple[float, float]:
-        """
-        Estimates flows using the TICK RULE (Lee-Ready).
-        Project Phoenix strictly uses L1 proxies, so we rely on price action.
-        """
         try:
-            # Logic: Compare current price to last price to assign volume direction
             last_price = self.last_prices.get(symbol, current_price)
-            
-            # Default to neutral if no history
             if last_price == 0:
                 return current_vol / 2.0, current_vol / 2.0
                 
             if current_price > last_price:
-                # Up Tick -> Aggressive Buyer -> Volume assigned to Bid
                 return float(current_vol), 0.0
             elif current_price < last_price:
-                # Down Tick -> Aggressive Seller -> Volume assigned to Ask
                 return 0.0, float(current_vol)
             else:
-                # Neutral Tick -> Split 50/50
                 half_vol = float(current_vol) / 2.0
                 return half_vol, half_vol
-            
         except Exception:
-            # Safe Fallback
             return 0.0, 0.0
 
     def _tick_stream_loop(self):
@@ -680,7 +601,6 @@ class HybridProducer:
         redis_failures = 0
         
         while self.running and not self.stop_event.is_set():
-            # AUDIT FIX: File-based Kill Switch
             if os.path.exists(KILL_SWITCH_FILE):
                 log.critical("💀 KILL SWITCH DETECTED. SHUTTING DOWN IMMEDIATELY.")
                 with self.mt5_lock: mt5.shutdown()
@@ -688,7 +608,7 @@ class HybridProducer:
                 
             start = time.time()
             try:
-                # QUANT UPGRADE: Update D1 and H4 Context periodically
+                # Update Context periodically
                 if time.time() - self.last_context_update > 60:
                     self._update_d1_context()
                     self._update_h4_context()
@@ -700,31 +620,19 @@ class HybridProducer:
                         tick = mt5.symbol_info_tick(sym)
                         if not tick: continue
                         
-                        # AUDIT FIX: JPY Precision for Serialization
                         sym_info = mt5.symbol_info(sym)
                         digits = sym_info.digits if sym_info else 5
                         bid = round(tick.bid, digits)
                         ask = round(tick.ask, digits)
-                        
-                        # Current tick volume
                         current_vol = float(tick.volume_real if tick.volume_real > 0 else tick.volume)
-                        
-                        # Use Last price if available, else Mid
                         price_now = tick.last if tick.last > 0 else (bid + ask) / 2.0
                         
-                        # --- PHOENIX FLOW INGESTION ---
-                        # Estimate flows via Tick Rule
                         bid_vol, ask_vol = self._estimate_flow_volumes(sym, current_vol, price_now)
-                        
-                        # Update state for next tick comparison
                         self.last_prices[sym] = price_now
-                        # --------------------------------
                         
                         self.cluster_engine.update_correlations(pd.DataFrame())
-                        
                         utc_ts = int(tick.time_msc) - int(self.exec_engine.broker_time_offset * 1000)
                         
-                        # QUANT UPGRADE: Include H4 and D1 Context in Payload
                         payload = {
                             "symbol": sym, "time": utc_ts,
                             "bid": bid,
@@ -734,19 +642,17 @@ class HybridProducer:
                             "bid_vol": float(bid_vol),
                             "ask_vol": float(ask_vol),
                             "ctx_d1": json.dumps(self.d1_cache.get(sym, {})),
-                            "ctx_h4": json.dumps(self.h4_cache.get(sym, {})) # NEW: H4 Data
+                            "ctx_h4": json.dumps(self.h4_cache.get(sym, {}))
                         }
                         
-                        # AUDIT FIX: Redis Memory Cap (maxlen)
                         if sym in SYMBOLS: pipe.xadd(STREAM_KEY, payload, maxlen=10000, approximate=True)
                         key = self.monitored_price_keys.get(sym, f"price:{sym}")
                         pipe.hset(key, mapping={"bid": payload["bid"], "ask": payload["ask"], "time": int(utc_ts/1000)})
                 
                 pipe.execute()
                 self.r.setex(CONFIG['redis']['heartbeat_key'], 10, str(time.time()))
-                redis_failures = 0 # Reset on success
+                redis_failures = 0
             except (redis.ConnectionError, redis.TimeoutError) as e:
-                # AUDIT FIX: Exponential Backoff for Redis
                 redis_failures += 1
                 sleep_time = min(2 ** redis_failures, 30)
                 log.error(f"Redis Disconnected. Retrying in {sleep_time}s... ({e})")
@@ -758,17 +664,24 @@ class HybridProducer:
             time.sleep(max(0.0, interval - elapsed))
 
     def _update_d1_context(self):
+        """
+        V10.0 UPDATE: Precision EMA calculation for Trend Filter.
+        Fetches 500 bars to ensure EMA 200 convergence.
+        """
         for sym in SYMBOLS:
             with self.mt5_lock:
-                rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_D1, 1, 200)
-                if rates is not None and len(rates) > 0:
+                # Fetch 500 bars for accurate tail (200 is insufficient for startup)
+                rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_D1, 1, 500)
+                if rates is not None and len(rates) > 200:
                     r = rates[-1]
-                    ema = 0.0
-                    if len(rates) >= 200:
-                        closes = np.array([x['close'] for x in rates])
-                        weights = np.exp(np.linspace(-1., 0., 200))
-                        weights /= weights.sum()
-                        ema = np.convolve(closes, weights, mode='valid')[0]
+                    
+                    # Convert to Series
+                    closes = pd.Series([x['close'] for x in rates])
+                    
+                    # V10.0: Standard Pandas EWM (span=200) for mathematical consistency
+                    ema_series = closes.ewm(span=200, adjust=False).mean()
+                    ema = ema_series.iloc[-1]
+                    
                     self.d1_cache[sym] = {
                         'open': float(r['open']), 'high': float(r['high']),
                         'low': float(r['low']), 'close': float(r['close']),
@@ -777,27 +690,29 @@ class HybridProducer:
 
     def _update_h4_context(self):
         """
-        QUANT UPGRADE: Fetches H4 data and calculates RSI(14).
-        Stores in self.h4_cache.
+        V10.0 UPDATE: Standard RSI 14 (Wilder's Smoothing).
         """
         for sym in SYMBOLS:
             with self.mt5_lock:
-                # Fetch enough bars for RSI(14)
-                rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_H4, 1, 30)
+                rates = mt5.copy_rates_from_pos(sym, mt5.TIMEFRAME_H4, 1, 100) # Fetch more for RSI smoothing
                 if rates is not None and len(rates) > 14:
                     r = rates[-1]
                     
-                    # Manual RSI Calc using pandas to avoid heavy deps if possible, but pandas is imported
+                    # RSI Calculation (Standard Wilder's)
                     df = pd.DataFrame(rates)
                     delta = df['close'].diff()
-                    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-                    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                    
+                    # Wilder's Smoothing: alpha = 1/N (com = N-1)
+                    # For RSI 14, com = 13
+                    gain = (delta.where(delta > 0, 0)).ewm(com=13, adjust=False).mean()
+                    loss = (-delta.where(delta < 0, 0)).ewm(com=13, adjust=False).mean()
                     
                     rs = gain / loss
                     rsi = 100 - (100 / (1 + rs))
                     current_rsi = rsi.iloc[-1]
                     
                     if np.isnan(current_rsi): current_rsi = 50.0
+                    
                     self.h4_cache[sym] = {
                         'open': float(r['open']),
                         'high': float(r['high']),
@@ -814,11 +729,10 @@ class HybridProducer:
         
         while self.running:
             try:
-                # Trim request stream periodically
                 if int(time.time()) % 60 == 0:
                     self.r.xtrim(TRADE_REQUEST_STREAM, maxlen=1000, approximate=True)
                 entries = self.r.xreadgroup("execution_group", "producer_main", {TRADE_REQUEST_STREAM: '>'}, count=5, block=1000)
-                redis_failures = 0 # Reset on success
+                redis_failures = 0 
                 
                 if entries:
                     for stream, messages in entries:
@@ -826,7 +740,6 @@ class HybridProducer:
                             self.execution_queue.put((msg_id, data))
             
             except (redis.ConnectionError, redis.TimeoutError) as e:
-                # AUDIT FIX: Exponential Backoff for Redis
                 redis_failures += 1
                 sleep_time = min(2 ** redis_failures, 30)
                 log.error(f"Redis Listener Disconnected. Retrying in {sleep_time}s... ({e})")
@@ -841,8 +754,6 @@ class HybridProducer:
             action = data['action']
             uuid_val = data.get('uuid')
             
-            # --- REC 4: ADAPTIVE TTL IMPLEMENTATION ---
-            # Parse timestamp and update Latency Monitor
             request_ts_str = data.get('timestamp')
             
             if request_ts_str:
@@ -851,17 +762,15 @@ class HybridProducer:
                     now_ts = time.time()
                     latency = now_ts - request_ts
                     
-                    # Update statistical model
                     self.ttl_manager.update(latency)
                     current_ttl = self.ttl_manager.get_ttl()
                     
                     if latency > current_ttl:
                         log.error(f"🧟 ZOMBIE TRADE DROPPED: {symbol} Lag: {latency:.2f}s > {current_ttl:.1f}s")
                         self.r.xack(TRADE_REQUEST_STREAM, "execution_group", msg_id)
-                        return # ACK and DROP
+                        return
                 except ValueError:
                     log.error(f"Invalid timestamp: {request_ts_str}")
-            # ---------------------------------------------
 
             if uuid_val:
                 if self.r.sismember("processed_signals", uuid_val):
@@ -909,30 +818,24 @@ class HybridProducer:
 
     def _closed_trade_monitor(self):
         """
-        NEW: Polls MT5 for closed trades and publishes them to Redis Stream.
-        Critical for Linux Engine's SQN Calculation.
+        Polls MT5 for closed trades and publishes them to Redis Stream.
+        V10.0: Critical for Engine's Daily Loss Limit.
         """
         log.info("Starting Closed Trade Monitor (SQN Feed)...")
-        # Use simple tracking, assume we only care about trades closed while running
-        # or just query last few minutes.
         while self.running and not self.stop_event.is_set():
             try:
                 now = datetime.now()
-                # Query window: From last scan time to now
                 with self.mt5_lock:
                     deals = mt5.history_deals_get(self.last_deal_scan_time, now)
                 
-                self.last_deal_scan_time = now # Update cursor
+                self.last_deal_scan_time = now
                 
                 if deals:
                     pipe = self.r.pipeline()
                     published_count = 0
                     
                     for deal in deals:
-                        # Filter by Magic Number and Entry type (OUT or IN/OUT)
                         if deal.magic == MAGIC_NUMBER and deal.entry in [mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT]:
-                            # Calculate net profit for this deal
-                            # Note: In hedging, a deal closes a specific position.
                             net_pnl = deal.profit + deal.swap + deal.commission
                             
                             payload = {
@@ -944,8 +847,6 @@ class HybridProducer:
                                 "reason": deal.reason,
                                 "timestamp": deal.time
                             }
-                            
-                            # Publish to Stream
                             pipe.xadd(CLOSED_TRADE_STREAM, payload, maxlen=1000, approximate=True)
                             published_count += 1
                             
@@ -956,7 +857,7 @@ class HybridProducer:
             except Exception as e:
                 log.error(f"Closed Trade Monitor Error: {e}")
                 
-            time.sleep(5) # Poll every 5s
+            time.sleep(5)
 
     def _sync_positions(self):
         while self.running:
@@ -1057,13 +958,8 @@ class HybridProducer:
             time.sleep(60)
 
     def _pending_order_monitor(self):
-        """
-        Monitors pending Limit Orders. Cancels zombies (older than 60s) to enforce expiration.
-        Updates status on fills.
-        """
         while self.running:
             try:
-                # AUDIT FIX: Memory Leak Prevention (Cleanup notified tickets)
                 if len(self.notified_tickets) > 5000:
                     recent = list(self.notified_tickets)[-1000:]
                     self.notified_tickets = set(recent)
@@ -1080,8 +976,6 @@ class HybridProducer:
                                         }))
                                         self.notified_tickets.add(order.ticket)
                                 
-                                # QUANT UPGRADE: Tight Expiration Control
-                                # Cancel Limit Orders older than 60 seconds
                                 if time.time() - order.time_setup > 60:
                                     log.info(f"Cancelling Zombie Order {order.ticket} (Pending > 60s)")
                                     req = {"action": mt5.TRADE_ACTION_REMOVE, "order": order.ticket}
@@ -1098,7 +992,7 @@ class HybridProducer:
             threading.Thread(target=self._candle_sync_loop, daemon=True),
             threading.Thread(target=self._midnight_watchman_loop, daemon=True),
             threading.Thread(target=self._pending_order_monitor, daemon=True),
-            threading.Thread(target=self._closed_trade_monitor, daemon=True) # NEW: SQN Feed
+            threading.Thread(target=self._closed_trade_monitor, daemon=True)
         ]
         for t in threads: t.start()
         
