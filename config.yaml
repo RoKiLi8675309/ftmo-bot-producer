@@ -1,11 +1,11 @@
 # =============================================================================
-# config.yaml – PROJECT PHOENIX V10.2 (INSTITUTIONAL OPTIMIZATION)
+# config.yaml – PROJECT PHOENIX V10.2.1 (KER RELAXATION FIX)
 # STATUS: ACTIVE | TARGET: PASS FTMO CHALLENGE
 #
-# STRATEGY UPDATE (V10.2 - AUDIT COMPLIANCE):
-# 1. LOGIC MAPPING: Enforced Hurst-based Regime Switching (Trend vs Mean Rev).
-# 2. GATES: Stricter KER (0.3) to reject "Noise/Chop".
-# 3. RISK: RVOL > 3.0 triggers volatility tightening.
+# STRATEGY UPDATE (V10.2.1 - CRITICAL FIX):
+# 1. GATES: Relaxed KER Threshold (0.30 -> 0.05) to fix "Zero Trade" pruning.
+#    - Empirical data showed 0.30 was too strict for Tick Imbalance Bars.
+# 2. LOGIC: Retained Hurst & RVOL logic.
 # =============================================================================
 
 # --- ENVIRONMENT SPECIFIC ---
@@ -154,7 +154,7 @@ phoenix_strategy:
   # See Table 2 in Audit Document
   hurst_breakout_threshold: 0.60      # Persistent Trend -> Breakout Logic
   hurst_mean_reversion_threshold: 0.40 # Mean Reversion -> Bollinger Fades
-  ker_trend_threshold: 0.30           # AUDIT FIX: Raised from 0.05 to 0.30 (Noise Block)
+  ker_trend_threshold: 0.05           # AUDIT FIX: REVERTED to 0.05 from 0.30 to fix pruning
   
   rvol_volatility_trigger: 3.0        # Liquidity Injection -> Tighten Stops
   
