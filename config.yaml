@@ -277,9 +277,11 @@ trading:
   symbols:
     - "EURUSD"  # TARGET: MEAN REVERSION
     - "GBPUSD"  # TARGET: TREND BREAKOUT
+    - "USDJPY"  # TARGET: TREND BREAKOUT (Added)
+    - "AUDUSD"  # TARGET: MEAN REVERSION (Added)
+    # Add other pairs here if you have data for them
   
   auxiliary_symbols:
-    - "USDJPY"
     - "USDCAD"
     - "USDCHF"
     - "NZDUSD"
