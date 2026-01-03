@@ -10,9 +10,9 @@
 # 4. Publishes Closed Trades -> Redis (Critical for V10.0 Circuit Breaker).
 #
 # PHOENIX V10.0 UPGRADES:
-# - D1 CONTEXT: Upgraded EMA 200 calculation (Fetch 500 bars + Pandas EWM).
-# - H4 CONTEXT: Upgraded RSI 14 calculation (Wilder's Smoothing).
-# - COMPLIANCE: Validated 'stream:closed_trades' feed for Engine Circuit Breaker.
+# - RISK: Implemented "Midnight Anchor" to capture 00:00 Server Time Equity.
+# - HARD DECK: Enforces immediate liquidation if Equity breaches Daily Loss Limit.
+# - COMPLIANCE: Validates 'stream:closed_trades' feed for Engine Circuit Breaker.
 # =============================================================================
 import os
 import sys
@@ -477,12 +477,18 @@ class HybridProducer:
                         if d.magic == MAGIC_NUMBER:
                             realized_pnl_today += (d.profit + d.swap + d.commission)
                     
+                    # Re-calculate Starting Equity for today
                     calculated_start = current_balance - realized_pnl_today
                     self.ftmo_monitor.starting_equity_of_day = calculated_start
                     self.r.set(CONFIG['redis']['risk_keys']['daily_starting_equity'], calculated_start)
                     self.r.set("bot:account_size", self.ftmo_monitor.initial_balance) 
                     
-                    log.info(f"{LogSymbols.SUCCESS} RISK STATE VERIFIED: Start Equity: {calculated_start:.2f} | Realized Today: {realized_pnl_today:.2f} | Account: {self.ftmo_monitor.initial_balance}")
+                    # V10.0: Set Hard Deck Level immediately
+                    loss_limit = calculated_start * CONFIG['risk_management']['max_daily_loss_pct']
+                    hard_deck = calculated_start - loss_limit
+                    self.r.set("risk:hard_deck_level", hard_deck)
+                    
+                    log.info(f"{LogSymbols.SUCCESS} RISK STATE VERIFIED: Start Equity: {calculated_start:.2f} | Hard Deck: {hard_deck:.2f} | Account: {self.ftmo_monitor.initial_balance}")
                     return
             
             except Exception as e:
@@ -860,6 +866,9 @@ class HybridProducer:
             time.sleep(5)
 
     def _sync_positions(self):
+        """
+        Syncs positions and Enforces HARD DECK (Daily Limit).
+        """
         while self.running:
             try:
                 with self.mt5_lock:
@@ -879,6 +888,16 @@ class HybridProducer:
                             log.critical("RISK BREACH DETECTED IN SYNC LOOP. ATTEMPTING LIQUIDATION.")
                             self._close_all_positions()
                     
+                    # --- V10.0 HARD DECK ENFORCEMENT ---
+                    try:
+                        hard_deck = float(self.r.get("risk:hard_deck_level") or 0.0)
+                        if hard_deck > 0 and info.equity < hard_deck:
+                            log.critical(f"💀 HARD DECK BREACHED: Equity {info.equity} < {hard_deck}. LIQUIDATING ALL.")
+                            self._close_all_positions()
+                    except Exception as e:
+                        log.error(f"Hard Deck Check Failed: {e}")
+                    # -----------------------------------
+
                     pos_list = []
                     if positions:
                         for p in positions:
@@ -910,21 +929,63 @@ class HybridProducer:
             return False
 
     def _midnight_watchman_loop(self):
-        log.info("Starting Midnight Watchman...")
+        """
+        V10.0: Midnight Anchor Protocol.
+        Captures Server 00:00 Equity accurately to establish daily loss limits.
+        """
+        log.info("Starting Midnight Watchman (Anchor Protocol)...")
         freeze_key = CONFIG['redis']['risk_keys']['midnight_freeze']
+        daily_start_key = CONFIG['redis']['risk_keys']['daily_starting_equity']
+        hard_deck_key = "risk:hard_deck_level"
+        
+        # Use config timezone or default to Prague (FTMO server time)
         tz_name = CONFIG['risk_management'].get('risk_timezone', 'Europe/Prague')
         risk_tz = pytz.timezone(tz_name)
         
+        last_anchor_date = None
+        
         while self.running and not self.stop_event.is_set():
-            now = datetime.now(timezone.utc).replace(tzinfo=timezone.utc).astimezone(risk_tz)
-            if (now.hour == 23 and now.minute >= 55) or (now.hour == 0 and now.minute <= 5):
+            # Get current server time
+            now_utc = datetime.now(timezone.utc)
+            now_server = now_utc.astimezone(risk_tz)
+            
+            # --- PHASE 1: FREEZE (23:55 - 00:05) ---
+            if (now_server.hour == 23 and now_server.minute >= 55) or (now_server.hour == 0 and now_server.minute <= 5):
                 self.r.set(freeze_key, "1")
-                if now.second % 30 == 0: log.info("MIDNIGHT WATCHMAN: Trading Frozen.")
+                
+                # --- PHASE 2: ANCHOR SNAPSHOT (00:00:01) ---
+                # We do this once per day, right after midnight
+                if now_server.hour == 0 and now_server.minute == 0 and now_server.date() != last_anchor_date:
+                    log.warning("⚓ MIDNIGHT ANCHOR: Capturing Daily Starting Equity...")
+                    
+                    max_retries = 5
+                    for attempt in range(max_retries):
+                        with self.mt5_lock:
+                            info = mt5.account_info()
+                            if info:
+                                start_equity = info.equity
+                                
+                                # 1. Set Daily Start
+                                self.r.set(daily_start_key, start_equity)
+                                
+                                # 2. Calculate Hard Deck
+                                max_loss_pct = CONFIG['risk_management']['max_daily_loss_pct']
+                                loss_limit = start_equity * max_loss_pct
+                                hard_deck = start_equity - loss_limit
+                                self.r.set(hard_deck_key, hard_deck)
+                                
+                                log.info(f"⚓ ANCHOR SET: Start {start_equity} | Hard Deck {hard_deck}")
+                                last_anchor_date = now_server.date()
+                                break
+                        time.sleep(1)
+            
+            # --- PHASE 3: UNFREEZE ---
             elif self.r.exists(freeze_key):
-                if (now.hour == 0 and now.minute > 5) or (now.hour > 0):
+                if (now_server.hour == 0 and now_server.minute > 5) or (now_server.hour > 0):
                     self.r.delete(freeze_key)
                     log.info("MIDNIGHT WATCHMAN: Trading Resumed.")
-            time.sleep(10)
+            
+            time.sleep(1)
 
     def _candle_sync_loop(self):
         log.info("Starting Candle Sync Loop...")
