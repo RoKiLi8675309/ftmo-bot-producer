@@ -9,10 +9,9 @@
 # 3. Executes Trades <- Redis (Limit Orders).
 # 4. Publishes Closed Trades -> Redis (Critical for V10.0 Circuit Breaker).
 #
-# PHOENIX V10.0 UPGRADES:
+# PHOENIX V11.1 UPDATE:
+# - SYNC: Added 'time' and 'magic' to Position Sync for V11 Time-Stop Logic.
 # - RISK: Implemented "Midnight Anchor" to capture 00:00 Server Time Equity.
-# - HARD DECK: Enforces immediate liquidation if Equity breaches Daily Loss Limit.
-# - COMPLIANCE: Validates 'stream:closed_trades' feed for Engine Circuit Breaker.
 # =============================================================================
 import os
 import sys
@@ -868,6 +867,7 @@ class HybridProducer:
     def _sync_positions(self):
         """
         Syncs positions and Enforces HARD DECK (Daily Limit).
+        V11.1: Adds 'time' field for Engine Time-Stop enforcement.
         """
         while self.running:
             try:
@@ -906,7 +906,8 @@ class HybridProducer:
                                     "ticket": p.ticket, "symbol": p.symbol,
                                     "type": "BUY" if p.type == mt5.ORDER_TYPE_BUY else "SELL",
                                     "volume": p.volume, "entry_price": p.price_open,
-                                    "profit": p.profit, "sl": p.sl, "tp": p.tp
+                                    "profit": p.profit, "sl": p.sl, "tp": p.tp,
+                                    "time": p.time, "magic": p.magic, "comment": p.comment # V11.1 Update
                                 })
                     key = f"{CONFIG['redis']['position_state_key_prefix']}:{MAGIC_NUMBER}"
                     self.r.set(key, json.dumps(pos_list))
