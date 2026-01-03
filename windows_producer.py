@@ -9,8 +9,8 @@
 # 3. Executes Trades <- Redis (Limit Orders).
 # 4. Publishes Closed Trades -> Redis (Critical for V10.0 Circuit Breaker).
 #
-# PHOENIX V12.2 UPDATE:
-# - SYNC: Explicit subscription to expanded symbol list (8 pairs).
+# PHOENIX V12.4 UPDATE (SNIPER MODE):
+# - SYNC: Subscription optimized for High-Vol pairs only.
 # - RISK: Implemented "Midnight Anchor" to capture 00:00 Server Time Equity.
 # =============================================================================
 import os
@@ -73,7 +73,7 @@ setup_logging("WindowsProducer")
 log = logging.getLogger("Producer")
 
 # --- CONFIGURATION CONSTANTS ---
-SYMBOLS = CONFIG['trading']['symbols']
+SYMBOLS = CONFIG['trading'].get('symbols', [])
 # Ensure we also subscribe to auxiliaries for conversion
 AUX_SYMBOLS = CONFIG['trading'].get('auxiliary_symbols', [])
 ALL_MONITORED_SYMBOLS = list(set(SYMBOLS + AUX_SYMBOLS))
@@ -86,7 +86,7 @@ MIDNIGHT_BUFFER_MINUTES = 30
 KILL_SWITCH_FILE = "kill_switch.lock"
 
 # Execution Settings (Limit Order Offset)
-LIMIT_OFFSET_PIPS = CONFIG['trading'].get('limit_order_offset_pips', 0.5)
+LIMIT_OFFSET_PIPS = CONFIG['trading'].get('limit_order_offset_pips', 0.2)
 
 # Dynamic Timeframe Mapping
 TARGET_TF_STR = CONFIG['trading'].get('timeframe', 'M5').upper()
@@ -136,7 +136,7 @@ class MT5ExecutionEngine:
     """
     def __init__(self, redis_client, lock: threading.RLock, risk_monitor: FTMORiskMonitor):
         self.lock = lock
-        self.default_deviation = CONFIG['trading'].get('slippage', 10)
+        self.default_deviation = CONFIG['trading'].get('slippage', 5)
         self.magic_number = CONFIG['trading']['magic_number']
         self.r = redis_client
         self.risk_monitor = risk_monitor
