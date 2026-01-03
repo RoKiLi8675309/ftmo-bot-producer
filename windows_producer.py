@@ -9,8 +9,8 @@
 # 3. Executes Trades <- Redis (Limit Orders).
 # 4. Publishes Closed Trades -> Redis (Critical for V10.0 Circuit Breaker).
 #
-# PHOENIX V11.1 UPDATE:
-# - SYNC: Added 'time' and 'magic' to Position Sync for V11 Time-Stop Logic.
+# PHOENIX V12.2 UPDATE:
+# - SYNC: Explicit subscription to expanded symbol list (8 pairs).
 # - RISK: Implemented "Midnight Anchor" to capture 00:00 Server Time Equity.
 # =============================================================================
 import os
@@ -74,6 +74,10 @@ log = logging.getLogger("Producer")
 
 # --- CONFIGURATION CONSTANTS ---
 SYMBOLS = CONFIG['trading']['symbols']
+# Ensure we also subscribe to auxiliaries for conversion
+AUX_SYMBOLS = CONFIG['trading'].get('auxiliary_symbols', [])
+ALL_MONITORED_SYMBOLS = list(set(SYMBOLS + AUX_SYMBOLS))
+
 STREAM_KEY = CONFIG['redis']['price_data_stream']
 TRADE_REQUEST_STREAM = CONFIG['redis']['trade_request_stream']
 CLOSED_TRADE_STREAM = CONFIG['redis'].get('closed_trade_stream_key', 'stream:closed_trades')
@@ -427,11 +431,12 @@ class HybridProducer:
             else:
                 log.warning("MT5 Credentials missing in Config. Running in initialized mode only.")
             
-            for sym in SYMBOLS:
+            # Subscribe to ALL configured symbols (Target + Aux)
+            for sym in ALL_MONITORED_SYMBOLS:
                 if not mt5.symbol_select(sym, True):
                     log.error(f"Failed to select symbol {sym}")
                 else:
-                    log.info(f"Subscribed to {sym} (L1 Mode)")
+                    log.info(f"Subscribed to {sym}")
 
     def _reconstruct_risk_state_from_history(self):
         log.info("Reconstructing Risk State (FTMO Compliance)...")
@@ -565,7 +570,8 @@ class HybridProducer:
             self.conn.commit()
 
     def _ensure_conversion_pairs(self) -> Set[str]:
-        monitored = set(SYMBOLS)
+        # Start with all symbols explicitly configured
+        monitored = set(ALL_MONITORED_SYMBOLS)
         with self.mt5_lock:
             account_info = mt5.account_info()
             if not account_info: return monitored
