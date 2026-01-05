@@ -9,9 +9,9 @@
 # 3. Executes Trades <- Redis (Limit Orders).
 # 4. Publishes Closed Trades -> Redis (Critical for V10.0 Circuit Breaker).
 #
-# PHOENIX V12.4 UPDATE (SNIPER MODE):
-# - SYNC: Subscription optimized for High-Vol pairs only.
-# - RISK: Implemented "Midnight Anchor" to capture 00:00 Server Time Equity.
+# PHOENIX V12.4 UPDATE (SNIPER MODE - AGGRESSOR PROTOCOL):
+# - SYNC: Subscription optimized for High-Vol pairs (GBPAUD, EURJPY).
+# - RISK: "Midnight Anchor" captures 00:00 Server Time Equity for Daily Limits.
 # =============================================================================
 import os
 import sys
