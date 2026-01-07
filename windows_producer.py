@@ -9,7 +9,8 @@
 # 3. Executes Trades <- Redis (Limit Orders).
 # 4. Publishes Closed Trades -> Redis (Critical for V10.0 Circuit Breaker).
 #
-# PHOENIX V12.4 UPDATE (SNIPER MODE - AGGRESSOR PROTOCOL):
+# PHOENIX V12.8 UPDATE (SOURCE DEDUPLICATION):
+# - FIX: Added strict `time_msc` check to prevent broadcasting duplicate ticks.
 # - SYNC: Subscription optimized for High-Vol pairs (GBPAUD, EURJPY).
 # - RISK: "Midnight Anchor" captures 00:00 Server Time Equity for Daily Limits.
 # =============================================================================
@@ -29,6 +30,7 @@ from typing import Dict, Any, List, Optional, Set, Tuple, Union
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
+from collections import defaultdict
 
 # --- PATH SAFETY FIX ---
 # Ensure the current directory is in sys.path so 'shared' can be imported
@@ -357,6 +359,9 @@ class HybridProducer:
         self.last_context_update = 0
         self.notified_tickets = set()
         
+        # --- DEDUPLICATION STATE ---
+        self.last_tick_time = defaultdict(int)
+        
         self.last_prices = {s: 0.0 for s in SYMBOLS}
         self.last_deal_scan_time = datetime.now() - timedelta(minutes=1)
         
@@ -607,7 +612,7 @@ class HybridProducer:
             return 0.0, 0.0
 
     def _tick_stream_loop(self):
-        log.info("Starting Tick Stream...")
+        log.info(f"{LogSymbols.ONLINE} Starting Deduplicated Tick Stream...")
         interval = CONFIG['producer']['tick_interval_seconds']
         redis_failures = 0
         
@@ -626,10 +631,19 @@ class HybridProducer:
                     self.last_context_update = time.time()
                 
                 pipe = self.r.pipeline()
+                updates_count = 0
+                
                 for sym in self.monitored_symbols:
                     with self.mt5_lock:
                         tick = mt5.symbol_info_tick(sym)
                         if not tick: continue
+                        
+                        # --- V12.8 FIX: SOURCE DEDUPLICATION ---
+                        # Only process if the timestamp has actually advanced.
+                        # This prevents the "Zombie Tick" loop that causes artificial clock skew.
+                        if tick.time_msc <= self.last_tick_time[sym]:
+                            continue
+                        self.last_tick_time[sym] = tick.time_msc
                         
                         sym_info = mt5.symbol_info(sym)
                         digits = sym_info.digits if sym_info else 5
@@ -656,11 +670,16 @@ class HybridProducer:
                             "ctx_h4": json.dumps(self.h4_cache.get(sym, {}))
                         }
                         
-                        if sym in SYMBOLS: pipe.xadd(STREAM_KEY, payload, maxlen=10000, approximate=True)
+                        if sym in SYMBOLS: 
+                            pipe.xadd(STREAM_KEY, payload, maxlen=10000, approximate=True)
+                            updates_count += 1
+                            
                         key = self.monitored_price_keys.get(sym, f"price:{sym}")
                         pipe.hset(key, mapping={"bid": payload["bid"], "ask": payload["ask"], "time": int(utc_ts/1000)})
                 
-                pipe.execute()
+                if updates_count > 0:
+                    pipe.execute()
+                    
                 self.r.setex(CONFIG['redis']['heartbeat_key'], 10, str(time.time()))
                 redis_failures = 0
             except (redis.ConnectionError, redis.TimeoutError) as e:
