@@ -5,10 +5,10 @@
 # DESCRIPTION:
 # The Gateway to the Market.
 #
-# PHOENIX V12.30 FIX (SERVER TIME AUTHORITY):
-# - FIX: 'Midnight Watchman' now calculates midnight using Broker Server Time directly.
-# - REASON: Eliminates timezone mismatches (e.g., Prague vs EE(S)T) for PnL resets.
-# - LOGIC: Continuous time sync ensures bot logs match MT5 Terminal exactly.
+# PHOENIX V12.37 FIX (EXECUTION LOGIC):
+# - FIX: Enforced TRADE_ACTION_DEAL for "MARKET" orders by zeroing price.
+# - REASON: Prevents Market orders from being misinterpreted as Pending Orders
+#   when the Dispatcher sends a snapshot price for reference.
 # =============================================================================
 import os
 import sys
@@ -221,26 +221,39 @@ class MT5ExecutionEngine:
                 info = mt5.symbol_info(broker_sym)
             return info
 
-    def _check_idempotency(self, symbol: str, comment: str, lookback_sec: int = 45) -> Optional[Dict[str, Any]]:
-        # Sanitization changes comment, so we match on substring if truncated
-        # Or rely on time and symbol
+    def _check_idempotency(self, symbol: str, unique_id: str, lookback_sec: int = 60) -> Optional[Dict[str, Any]]:
+        """
+        V12.35 FIX: STRICT IDEMPOTENCY CHECK.
+        Scans comments of Open Positions AND Pending Orders for the unique signal ID.
+        """
+        if not unique_id: return None
+        
         broker_sym = self.symbol_map.get(symbol, symbol)
-        now_broker = time.time() + self.broker_time_offset
-        cutoff_msc = (now_broker - lookback_sec) * 1000
+        
+        # We assume the unique_id (UUID) was placed in the comment
+        # Note: MT5 comments are truncated to ~31 chars.
+        # UUID is 36 chars. We check if the comment *starts* with the first 16 chars of UUID or match logic.
+        # Actually, best practice is to put UUID at start of comment.
+        
+        search_token = unique_id[:8] # MT5 Comment limit safety (Short UUID)
+        
         with self.lock:
+            # 1. Check Positions (Live Trades)
             positions = mt5.positions_get(symbol=broker_sym)
             if positions:
                 for pos in positions:
-                    # Loose check on comment to handle truncation
-                    if comment[:15] in pos.comment and pos.time_msc > cutoff_msc:
-                        log.warning(f"IDEMPOTENCY: Found existing position {pos.ticket}.")
+                    if search_token in pos.comment:
+                        log.warning(f"🛑 IDEMPOTENCY GUARD: Signal {unique_id} already executing as Position {pos.ticket}.")
                         return {"retcode": mt5.TRADE_RETCODE_DONE, "order": pos.ticket, "price": pos.price_open}
+            
+            # 2. Check Orders (Pending Limits/Stops)
             orders = mt5.orders_get(symbol=broker_sym)
             if orders:
                 for order in orders:
-                    if comment[:15] in order.comment and order.time_setup_msc > cutoff_msc:
-                        log.warning(f"IDEMPOTENCY: Found existing pending order {order.ticket}.")
+                    if search_token in order.comment:
+                        log.warning(f"🛑 IDEMPOTENCY GUARD: Signal {unique_id} found as Pending Order {order.ticket}.")
                         return {"retcode": mt5.TRADE_RETCODE_PLACED, "order": order.ticket}
+                        
         return None
 
     def execute_trade(self, request: Dict[str, Any], max_retries: int = 3) -> Optional[Dict[str, Any]]:
@@ -262,6 +275,27 @@ class MT5ExecutionEngine:
             log.error(f"EXECUTION FAIL: Could not get symbol_info for {broker_sym}. Is it in Market Watch?")
             return None
         
+        # --- V12.35: EXTRACT UUID FROM COMMENT FOR IDEMPOTENCY ---
+        raw_comment = str(request.get("comment", ""))
+        # Assume format "Auto_<UUID>_..." or just pass UUID separately
+        # If no explicit ID in comment, we skip strict idempotency (fallback to timestamp)
+        
+        # We need the Original Signal UUID. 
+        # Ideally, it should be in the request dict.
+        # Let's assume the comment contains it or check request for 'uuid' key
+        signal_uuid = request.get('uuid', '')
+        if not signal_uuid and "Auto_" in raw_comment:
+             # Try to extract from "Auto_e671cfc8..."
+             parts = raw_comment.split('_')
+             if len(parts) > 1: signal_uuid = parts[1]
+
+        # --- PRE-FLIGHT IDEMPOTENCY CHECK ---
+        if signal_uuid:
+            existing = self._check_idempotency(raw_symbol, signal_uuid)
+            if existing:
+                log.info(f"✅ Trade {signal_uuid} already exists. Skipping duplicate.")
+                return existing
+
         # --- V12.27 FIX: PRE-INITIALIZE VARIABLES FOR SCOPE SAFETY ---
         explicit_price = 0.0
         safe_offset = 0.0
@@ -356,10 +390,20 @@ class MT5ExecutionEngine:
             if 'type_time' in request: request['type_time'] = int(request['type_time'])
             if 'type_filling' in request: request['type_filling'] = int(request['type_filling'])
 
-            # --- V12.23 COMMENT SANITIZATION ---
-            raw_comment = str(request.get("comment", ""))
+            # --- V12.36 COMMENT SANITIZATION (AGGRESSIVE TRUNCATION) ---
+            # MT5 allows ~31 chars. To be absolutely safe and prevent Retcode -2,
+            # we truncate to 23 chars. This leaves room for nulls/internal IDs.
+            # Priority: 8-char Short UUID.
             safe_comment = raw_comment.replace("|", " ").replace(":", " ").replace("%", "").replace("_", "")
-            request["comment"] = safe_comment[:20]
+            
+            if signal_uuid:
+                short_uuid = signal_uuid[:8]
+                # "e671cfc8 Algo Trade" -> 20 chars approx
+                final_comment = f"{short_uuid} {safe_comment}"
+            else:
+                final_comment = safe_comment
+            
+            request["comment"] = final_comment[:23].strip()
 
         except ValueError as e:
             log.error(f"Sanitization error for {broker_sym}: {e}")
@@ -368,6 +412,14 @@ class MT5ExecutionEngine:
         # --- EXECUTION LOOP ---
         log.info(f"🚀 SENDING ORDER TO MT5: {json.dumps(request, default=str)}")
         for attempt in range(max_retries):
+            # --- V12.35: RE-CHECK IDEMPOTENCY BEFORE RETRY ---
+            # If this is a retry, maybe the previous attempt actually worked despite timeout
+            if attempt > 0 and signal_uuid:
+                existing = self._check_idempotency(raw_symbol, signal_uuid)
+                if existing:
+                    log.info(f"✅ Trade {signal_uuid} appeared during retry. Stopping duplicate.")
+                    return existing
+
             with self.lock:
                 result = mt5.order_send(request)
             
@@ -382,8 +434,11 @@ class MT5ExecutionEngine:
                     time.sleep(0.5)
                     mt5.initialize()
                 
-                ghost = self._check_idempotency(raw_symbol, request["comment"])
-                if ghost: return ghost
+                # Check if it appeared
+                if signal_uuid:
+                    ghost = self._check_idempotency(raw_symbol, signal_uuid)
+                    if ghost: return ghost
+                
                 time.sleep(0.5)
                 continue
                 
@@ -921,7 +976,7 @@ class HybridProducer:
             
             # V12.19: Capture Price and Type from Payload
             price = float(data.get('price', 0.0))
-            order_type = data.get('type', None) # 'LIMIT' or 'MARKET'
+            order_type = data.get('type', 'MARKET').upper() # 'LIMIT', 'STOP', or 'MARKET'
             
             # Latency Check
             request_ts_str = data.get('timestamp')
@@ -937,7 +992,8 @@ class HybridProducer:
                 except ValueError:
                     log.error(f"Invalid timestamp: {request_ts_str}")
             
-            # Deduplication
+            # Deduplication (Redis Level)
+            # This is distinct from MT5 Idempotency - this stops the Producer from processing same message twice.
             if uuid_val:
                 if self.r.sismember("processed_signals", uuid_val):
                     log.warning(f"🔁 Duplicate Signal Ignored: {uuid_val}")
@@ -961,17 +1017,24 @@ class HybridProducer:
                 # VERBOSE EXECUTION LOG
                 log.info(f"⚡ EXECUTING {action} {symbol} | Vol: {data['volume']} | Price: {price} | Type: {order_type}")
                 
-                # V12.19: Pass Price and Type to Engine
+                # V12.37 FIX: EXECUTION LOGIC
+                # If order type is MARKET, force price to 0.0 to trigger Instant Execution in execute_trade
+                # independent of the snapshot price sent for reference by Dispatcher.
+                exec_price = price
+                if "MARKET" in order_type:
+                    exec_price = 0.0
+
                 self.exec_engine.execute_trade({
                     "action": mt5.TRADE_ACTION_DEAL, # Default to DEAL, execute_trade will upgrade to PENDING if needed
                     "symbol": symbol,
                     "volume": float(data['volume']),
                     "type": mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL,
-                    "price": price, # Pass 0 if Market
+                    "price": exec_price, # Pass 0.0 if Market to force Auto-Price
                     "sl": float(data.get("stop_loss", 0)), 
                     "tp": float(data.get("take_profit", 0)),
                     "magic": MAGIC_NUMBER, 
-                    "comment": data.get("comment", "Algo")
+                    "comment": data.get("comment", "Algo"),
+                    "uuid": uuid_val # V12.35: Pass UUID for idempotency
                 })
             
             elif action == "MODIFY":
