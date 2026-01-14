@@ -5,10 +5,9 @@
 # DESCRIPTION:
 # The Gateway to the Market.
 #
-# PHOENIX V12.37 FIX (EXECUTION LOGIC):
-# - FIX: Enforced TRADE_ACTION_DEAL for "MARKET" orders by zeroing price.
-# - REASON: Prevents Market orders from being misinterpreted as Pending Orders
-#   when the Dispatcher sends a snapshot price for reference.
+# PHOENIX V14.1 UPDATE (STALE SIGNAL GUARD):
+# - FIX: Added strict latency check. Signals older than 60s are REJECTED.
+# - REASON: Prevents execution of queued "ghost" trades from tests/crashes.
 # =============================================================================
 import os
 import sys
@@ -81,6 +80,9 @@ MAGIC_NUMBER = CONFIG['trading']['magic_number']
 MIDNIGHT_BUFFER_MINUTES = 30
 KILL_SWITCH_FILE = "kill_switch.lock"
 LIMIT_OFFSET_PIPS = CONFIG['trading'].get('limit_order_offset_pips', 0.2)
+
+# V14.1 SAFETY: Max allowed latency for a signal before it is deemed STALE
+MAX_TRADE_LATENCY_SECONDS = 60.0
 
 # Dynamic Timeframe Mapping
 TARGET_TF_STR = CONFIG['trading'].get('timeframe', 'M5').upper()
@@ -996,8 +998,16 @@ class HybridProducer:
                     latency = abs(now_ts - request_ts)
                     self.ttl_manager.update(latency)
                     current_ttl = self.ttl_manager.get_ttl()
+                    
+                    # V14.1 STALE SIGNAL GUARD
+                    if latency > MAX_TRADE_LATENCY_SECONDS:
+                        log.error(f"🛑 REJECTING STALE SIGNAL: {symbol} Latency: {latency:.2f}s > Limit: {MAX_TRADE_LATENCY_SECONDS}s.")
+                        self.r.xack(TRADE_REQUEST_STREAM, "execution_group", msg_id)
+                        return
+                    
                     if latency > current_ttl:
-                        log.warning(f"⚠️ HIGH LATENCY TRADE: {symbol} Latency: {latency:.2f}s > TTL: {current_ttl:.1f}s. EXECUTING ANYWAY.")
+                        log.warning(f"⚠️ HIGH LATENCY TRADE: {symbol} Latency: {latency:.2f}s > TTL: {current_ttl:.1f}s. EXECUTING ANYWAY (Within safe limit).")
+                        
                 except ValueError:
                     log.error(f"Invalid timestamp: {request_ts_str}")
             
