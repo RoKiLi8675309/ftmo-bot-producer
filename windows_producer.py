@@ -476,6 +476,15 @@ class MT5ExecutionEngine:
                         elif request["action"] == mt5.TRADE_ACTION_PENDING:
                              request["price"] = new_tick.bid - safe_offset if request["type"] == mt5.ORDER_TYPE_BUY_LIMIT else new_tick.ask + safe_offset
                              request["price"] = PrecisionGuard.normalize_price(request["price"], broker_sym, symbol_info)
+                        
+                        # V12.39 Fix: If it's a MARKET order that failed with Invalid Price (10015), update to latest tick
+                        elif request["action"] == mt5.TRADE_ACTION_DEAL:
+                            if request["type"] == mt5.ORDER_TYPE_BUY:
+                                request["price"] = new_tick.ask
+                            elif request["type"] == mt5.ORDER_TYPE_SELL:
+                                request["price"] = new_tick.bid
+                            request["price"] = PrecisionGuard.normalize_price(request["price"], broker_sym, symbol_info)
+
                 continue
             else:
                 log.error(f"❌ EXECUTION FAILURE: {broker_sym} Retcode: {result.retcode} ({result.comment})")
@@ -1098,7 +1107,9 @@ class HybridProducer:
                     if info:
                         self.r.hset(CONFIG['redis']['account_info_key'], mapping={
                             "balance": info.balance, "equity": info.equity,
-                            "margin": info.margin, "free_margin": info.margin_free, "updated": time.time()
+                            "margin": info.margin, 
+                            "free_margin": info.margin_free, # CRITICAL V13.1 for RiskManager
+                            "updated": time.time()
                         })
                         self.r.set(CONFIG['redis']['risk_keys']['current_equity'], info.equity)
                     if self.ftmo_monitor:
