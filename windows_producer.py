@@ -5,10 +5,10 @@
 # DESCRIPTION:
 # The Gateway to the Market.
 #
-# PHOENIX V16.1 MAINTENANCE PATCH:
-# - FIX: Added explicit float casting for all Redis payload fields (Price/Vol/SL/TP).
-# - REASON: Dispatcher now sends strings to preserve precision; comparisons caused TypeError.
-# - SAFETY: Enhanced error handling during request parsing.
+# PHOENIX V16.2 MAINTENANCE PATCH:
+# - FIX: Removed deprecated '_check_constraints' call causing AttributeErrors.
+# - REASON: FTMORiskMonitor uses 'can_trade()' as the single source of truth.
+# - SAFETY: Maintained pre-trade equity sync.
 # =============================================================================
 import os
 import sys
@@ -1005,7 +1005,7 @@ class HybridProducer:
                     info = mt5.account_info()
                     if info:
                         self.ftmo_monitor.equity = info.equity
-                        self.ftmo_monitor._check_constraints(0.0)
+                        # REMOVED DEPRECATED CALL: self.ftmo_monitor._check_constraints(0.0)
                         if not self.ftmo_monitor.can_trade():
                             log.warning("Trade blocked by Risk Monitor.")
                             self.r.xack(TRADE_REQUEST_STREAM, "execution_group", msg_id)
@@ -1133,7 +1133,7 @@ class HybridProducer:
                 account_info = mt5.account_info()
                 if not account_info: return False
                 self.ftmo_monitor.equity = account_info.equity
-                self.ftmo_monitor._check_constraints(0.0)
+                # REMOVED DEPRECATED CALL: self.ftmo_monitor._check_constraints(0.0)
                 if not self.ftmo_monitor.can_trade():
                     log.error(f"RISK REJECTION for {symbol}: {self.ftmo_monitor.check_circuit_breakers() if hasattr(self.ftmo_monitor, 'check_circuit_breakers') else 'Circuit Breaker Tripped'}")
                     return False
