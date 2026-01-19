@@ -5,9 +5,10 @@
 # DESCRIPTION:
 # The Gateway to the Market.
 #
-# PHOENIX V14.1 UPDATE (STALE SIGNAL GUARD):
-# - FIX: Added strict latency check. Signals older than 60s are REJECTED.
-# - REASON: Prevents execution of queued "ghost" trades from tests/crashes.
+# PHOENIX V16.1 MAINTENANCE PATCH:
+# - FIX: Added explicit float casting for all Redis payload fields (Price/Vol/SL/TP).
+# - REASON: Dispatcher now sends strings to preserve precision; comparisons caused TypeError.
+# - SAFETY: Enhanced error handling during request parsing.
 # =============================================================================
 import os
 import sys
@@ -231,12 +232,6 @@ class MT5ExecutionEngine:
         if not unique_id: return None
         
         broker_sym = self.symbol_map.get(symbol, symbol)
-        
-        # We assume the unique_id (UUID) was placed in the comment
-        # Note: MT5 comments are truncated to ~31 chars.
-        # UUID is 36 chars. We check if the comment *starts* with the first 16 chars of UUID or match logic.
-        # Actually, best practice is to put UUID at start of comment.
-        
         search_token = unique_id[:8] # MT5 Comment limit safety (Short UUID)
         
         with self.lock:
@@ -279,15 +274,8 @@ class MT5ExecutionEngine:
         
         # --- V12.35: EXTRACT UUID FROM COMMENT FOR IDEMPOTENCY ---
         raw_comment = str(request.get("comment", ""))
-        # Assume format "Auto_<UUID>_..." or just pass UUID separately
-        # If no explicit ID in comment, we skip strict idempotency (fallback to timestamp)
-        
-        # We need the Original Signal UUID. 
-        # Ideally, it should be in the request dict.
-        # Let's assume the comment contains it or check request for 'uuid' key
         signal_uuid = request.get('uuid', '')
         if not signal_uuid and "Auto_" in raw_comment:
-             # Try to extract from "Auto_e671cfc8..."
              parts = raw_comment.split('_')
              if len(parts) > 1: signal_uuid = parts[1]
 
@@ -298,7 +286,7 @@ class MT5ExecutionEngine:
                 log.info(f"✅ Trade {signal_uuid} already exists. Skipping duplicate.")
                 return existing
 
-        # --- V12.27 FIX: PRE-INITIALIZE VARIABLES FOR SCOPE SAFETY ---
+        # --- V16.1 FIX: TYPE SAFE INITIALIZATION ---
         explicit_price = 0.0
         safe_offset = 0.0
 
@@ -316,15 +304,19 @@ class MT5ExecutionEngine:
             
             pip_size = symbol_info.point * 10 if symbol_info.digits == 3 or symbol_info.digits == 5 else symbol_info.point
             
-            # --- STOPS LEVEL CHECK (CRITICAL FIX) ---
+            # --- STOPS LEVEL CHECK ---
             min_dist_points = symbol_info.trade_stops_level
             min_dist_price = min_dist_points * symbol_info.point
             config_offset_price = LIMIT_OFFSET_PIPS * pip_size
-            # safe_offset calculated here, used in Retry Loop
             safe_offset = max(config_offset_price, min_dist_price + (2 * symbol_info.point))
             
-            # --- V12.19 FIX: RESPECT EXPLICIT PRICE ---
-            explicit_price = request.get("price", 0.0)
+            # --- V16.1 CRITICAL FIX: EXPLICIT FLOAT CASTING ---
+            # Dispatcher sends strings ("0.0") to preserve precision.
+            # Comparison operators (>) will crash if we don't cast to float first.
+            try:
+                explicit_price = float(request.get("price", 0.0))
+            except (ValueError, TypeError):
+                explicit_price = 0.0
             
             if explicit_price > 0:
                 # Explicit Price provided: Respect it (Limit/Stop Logic)
@@ -341,11 +333,8 @@ class MT5ExecutionEngine:
                     
                     request["action"] = mt5.TRADE_ACTION_PENDING
                     request["type_time"] = mt5.ORDER_TIME_GTC
-            
             else:
-                # Market Order (No price): V12.26 INSTANT EXECUTION FIX
-                # REMOVED: Limit Conversion Optimization logic.
-                # ADDED: Immediate Execution at Tick Price.
+                # Market Order (No price or 0.0) -> Instant Execution
                 if request["action"] == mt5.TRADE_ACTION_DEAL:
                     if request["type"] == mt5.ORDER_TYPE_BUY:
                         request["price"] = tick.ask
@@ -357,8 +346,10 @@ class MT5ExecutionEngine:
                     request["type_time"] = mt5.ORDER_TIME_GTC
                     request["price"] = PrecisionGuard.normalize_price(request["price"], broker_sym, symbol_info)
 
+            # --- V16.1 FIX: SAFE FLOAT CASTING FOR ALL NUMERICS ---
+            raw_vol = float(request.get("volume", 0.01))
+            
             # Volume Normalization
-            raw_vol = float(request["volume"])
             vol_step = symbol_info.volume_step
             if vol_step > 0:
                 steps = round(raw_vol / vol_step)
@@ -367,10 +358,13 @@ class MT5ExecutionEngine:
             request["volume"] = round(request["volume"], 2)
 
             # SL/TP Normalization
-            if "sl" in request and float(request["sl"]) > 0:
-                request["sl"] = PrecisionGuard.normalize_price(float(request["sl"]), broker_sym, symbol_info)
-            if "tp" in request and float(request["tp"]) > 0:
-                request["tp"] = PrecisionGuard.normalize_price(float(request["tp"]), broker_sym, symbol_info)
+            raw_sl = float(request.get("sl", 0.0))
+            if raw_sl > 0:
+                request["sl"] = PrecisionGuard.normalize_price(raw_sl, broker_sym, symbol_info)
+            
+            raw_tp = float(request.get("tp", 0.0))
+            if raw_tp > 0:
+                request["tp"] = PrecisionGuard.normalize_price(raw_tp, broker_sym, symbol_info)
             
             # Fill Policy
             if request["action"] == mt5.TRADE_ACTION_PENDING:
@@ -381,7 +375,7 @@ class MT5ExecutionEngine:
                 elif filling & mt5.SYMBOL_FILLING_IOC: request["type_filling"] = mt5.ORDER_FILLING_IOC
                 else: request["type_filling"] = mt5.ORDER_FILLING_RETURN
             
-            # --- V12.22 PARANOID TYPE CASTING ---
+            # Final Type Casting for MT5 C++ Interface
             request['action'] = int(request['action'])
             request['type'] = int(request['type'])
             request['volume'] = float(request['volume'])
@@ -392,30 +386,23 @@ class MT5ExecutionEngine:
             if 'type_time' in request: request['type_time'] = int(request['type_time'])
             if 'type_filling' in request: request['type_filling'] = int(request['type_filling'])
 
-            # --- V12.36 COMMENT SANITIZATION (AGGRESSIVE TRUNCATION) ---
-            # MT5 allows ~31 chars. To be absolutely safe and prevent Retcode -2,
-            # we truncate to 23 chars. This leaves room for nulls/internal IDs.
-            # Priority: 8-char Short UUID.
+            # --- V12.36 COMMENT SANITIZATION ---
             safe_comment = raw_comment.replace("|", " ").replace(":", " ").replace("%", "").replace("_", "")
-            
             if signal_uuid:
                 short_uuid = signal_uuid[:8]
-                # "e671cfc8 Algo Trade" -> 20 chars approx
                 final_comment = f"{short_uuid} {safe_comment}"
             else:
                 final_comment = safe_comment
-            
             request["comment"] = final_comment[:23].strip()
 
-        except ValueError as e:
-            log.error(f"Sanitization error for {broker_sym}: {e}")
+        except (ValueError, TypeError) as e:
+            log.error(f"Sanitization/Casting error for {broker_sym}: {e}")
             return None
 
         # --- EXECUTION LOOP ---
         log.info(f"🚀 SENDING ORDER TO MT5: {json.dumps(request, default=str)}")
         for attempt in range(max_retries):
-            # --- V12.35: RE-CHECK IDEMPOTENCY BEFORE RETRY ---
-            # If this is a retry, maybe the previous attempt actually worked despite timeout
+            # --- RE-CHECK IDEMPOTENCY ---
             if attempt > 0 and signal_uuid:
                 existing = self._check_idempotency(raw_symbol, signal_uuid)
                 if existing:
@@ -429,14 +416,13 @@ class MT5ExecutionEngine:
                 err = mt5.last_error()
                 log.warning(f"MT5 Order Send returned None. LAST ERROR: {err}. Checking idempotency...")
                 
-                # --- V12.22 BRUTE FORCE RECONNECT ---
+                # --- BRUTE FORCE RECONNECT ---
                 log.warning("🔄 FORCING MT5 RECONNECT...")
                 with self.lock:
                     mt5.shutdown()
                     time.sleep(0.5)
                     mt5.initialize()
                 
-                # Check if it appeared
                 if signal_uuid:
                     ghost = self._check_idempotency(raw_symbol, signal_uuid)
                     if ghost: return ghost
@@ -453,7 +439,7 @@ class MT5ExecutionEngine:
                 log.info(f"✅ LIMIT ORDER PLACED: {broker_sym} Ticket: {result.order} @ {request['price']}")
                 return result._asdict()
             
-            # --- V12.28 FIX: ADDED INVALID_PRICE (10015) and INVALID_STOPS (10016) TO RETRY LOGIC ---
+            # --- RETRY LOGIC ---
             elif result.retcode in [mt5.TRADE_RETCODE_REQUOTE, mt5.TRADE_RETCODE_CONNECTION, mt5.TRADE_RETCODE_PRICE_OFF, mt5.TRADE_RETCODE_INVALID_PRICE, 10016]:
                 log.warning(f"Recoverable Error ({result.retcode}). Retrying...")
                 time.sleep(0.5 * (2 ** attempt))
@@ -461,12 +447,9 @@ class MT5ExecutionEngine:
                 with self.lock:
                     new_tick = mt5.symbol_info_tick(broker_sym)
                     if new_tick:
-                        # V12.28 FIX: Re-evaluate Order Type for Explicit Prices in case market moved
-                        # This catches cases where Limit became Stop (or vice-versa) during latency
+                        # V12.28 FIX: Re-evaluate Order Type
                         if explicit_price > 0:
-                            # Re-classify based on new tick
                             base_type = request["type"]
-                            # Normalize base type to pure BUY/SELL group for check
                             if base_type in [mt5.ORDER_TYPE_BUY, mt5.ORDER_TYPE_BUY_LIMIT, mt5.ORDER_TYPE_BUY_STOP]:
                                 if request["price"] < new_tick.ask: request["type"] = mt5.ORDER_TYPE_BUY_LIMIT
                                 else: request["type"] = mt5.ORDER_TYPE_BUY_STOP
@@ -474,12 +457,7 @@ class MT5ExecutionEngine:
                                 if request["price"] > new_tick.bid: request["type"] = mt5.ORDER_TYPE_SELL_LIMIT
                                 else: request["type"] = mt5.ORDER_TYPE_SELL_STOP
                         
-                        # Existing logic for offset-based prices
-                        elif request["action"] == mt5.TRADE_ACTION_PENDING:
-                             request["price"] = new_tick.bid - safe_offset if request["type"] == mt5.ORDER_TYPE_BUY_LIMIT else new_tick.ask + safe_offset
-                             request["price"] = PrecisionGuard.normalize_price(request["price"], broker_sym, symbol_info)
-                        
-                        # V12.39 Fix: If it's a MARKET order that failed with Invalid Price (10015), update to latest tick
+                        # Market Order update
                         elif request["action"] == mt5.TRADE_ACTION_DEAL:
                             if request["type"] == mt5.ORDER_TYPE_BUY:
                                 request["price"] = new_tick.ask
