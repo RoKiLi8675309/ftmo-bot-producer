@@ -5,10 +5,10 @@
 # DESCRIPTION:
 # The Gateway to the Market.
 #
-# PHOENIX V16.2 MAINTENANCE PATCH:
+# PHOENIX V16.3 MAINTENANCE PATCH:
+# - FIX: Replaced missing mt5.SYMBOL_FILLING_* constants with integers (1=FOK, 2=IOC).
+# - REASON: 'MetaTrader5' module attribute error caused trade execution failure.
 # - FIX: Removed deprecated '_check_constraints' call causing AttributeErrors.
-# - REASON: FTMORiskMonitor uses 'can_trade()' as the single source of truth.
-# - SAFETY: Maintained pre-trade equity sync.
 # =============================================================================
 import os
 import sys
@@ -371,8 +371,9 @@ class MT5ExecutionEngine:
                 request["type_filling"] = mt5.ORDER_FILLING_RETURN
             else:
                 filling = symbol_info.filling_mode
-                if filling & mt5.SYMBOL_FILLING_FOK: request["type_filling"] = mt5.ORDER_FILLING_FOK
-                elif filling & mt5.SYMBOL_FILLING_IOC: request["type_filling"] = mt5.ORDER_FILLING_IOC
+                # V16.3 FIX: Use integer constants 1 (FOK) and 2 (IOC) directly to avoid AttributeError
+                if filling & 1: request["type_filling"] = mt5.ORDER_FILLING_FOK
+                elif filling & 2: request["type_filling"] = mt5.ORDER_FILLING_IOC
                 else: request["type_filling"] = mt5.ORDER_FILLING_RETURN
             
             # Final Type Casting for MT5 C++ Interface
@@ -406,7 +407,7 @@ class MT5ExecutionEngine:
             if attempt > 0 and signal_uuid:
                 existing = self._check_idempotency(raw_symbol, signal_uuid)
                 if existing:
-                    log.info(f"✅ Trade {signal_uuid} appeared during retry. Stopping duplicate.")
+                    log.info(f"✅ Trade {signal_uuid} already exists. Skipping duplicate.")
                     return existing
 
             with self.lock:
