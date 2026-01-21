@@ -5,10 +5,9 @@
 # DESCRIPTION:
 # The Gateway to the Market.
 #
-# PHOENIX V16.3 MAINTENANCE PATCH:
-# - FIX: Replaced missing mt5.SYMBOL_FILLING_* constants with integers (1=FOK, 2=IOC).
-# - REASON: 'MetaTrader5' module attribute error caused trade execution failure.
-# - FIX: Removed deprecated '_check_constraints' call causing AttributeErrors.
+# PHOENIX V16.6 PATCH (LATENCY HARDENING):
+# - LATENCY: Reduced MAX_TRADE_LATENCY_SECONDS to 5.0s (Aggressor Mode).
+# - REASON: M5 Scalping requires immediate execution; 60s is too stale.
 # =============================================================================
 import os
 import sys
@@ -82,8 +81,9 @@ MIDNIGHT_BUFFER_MINUTES = 30
 KILL_SWITCH_FILE = "kill_switch.lock"
 LIMIT_OFFSET_PIPS = CONFIG['trading'].get('limit_order_offset_pips', 0.2)
 
-# V14.1 SAFETY: Max allowed latency for a signal before it is deemed STALE
-MAX_TRADE_LATENCY_SECONDS = 60.0
+# V16.6 SAFETY: Max allowed latency for a signal before it is deemed STALE
+# Reduced to 5.0s for Scalping. Old signals = Adverse Selection.
+MAX_TRADE_LATENCY_SECONDS = 5.0
 
 # Dynamic Timeframe Mapping
 TARGET_TF_STR = CONFIG['trading'].get('timeframe', 'M5').upper()
@@ -97,7 +97,7 @@ except AttributeError:
 
 # --- ADAPTIVE TTL MANAGER ---
 class AdaptiveTTLManager:
-    def __init__(self, base_ttl=30.0, max_ttl=300.0, alpha=0.1):
+    def __init__(self, base_ttl=5.0, max_ttl=30.0, alpha=0.1):
         self.base_ttl = base_ttl
         self.max_ttl = max_ttl
         self.alpha = alpha
@@ -114,10 +114,10 @@ class AdaptiveTTLManager:
             self.latency_var = (1 - self.alpha) * self.latency_var + self.alpha * (delta ** 2)
             jitter = math.sqrt(self.latency_var)
             
-            if self.avg_latency < 10.0 and jitter < 5.0:
+            if self.avg_latency < 2.0 and jitter < 1.0:
                 self.current_ttl = self.base_ttl
             else:
-                self.current_ttl = self.max_ttl
+                self.current_ttl = min(self.max_ttl, self.avg_latency + (3 * jitter))
 
     def get_ttl(self) -> float:
         return self.current_ttl
@@ -978,7 +978,7 @@ class HybridProducer:
                     self.ttl_manager.update(latency)
                     current_ttl = self.ttl_manager.get_ttl()
                     
-                    # V14.1 STALE SIGNAL GUARD
+                    # V16.6 STALE SIGNAL GUARD (SCALPER TUNING)
                     if latency > MAX_TRADE_LATENCY_SECONDS:
                         log.error(f"🛑 REJECTING STALE SIGNAL: {symbol} Latency: {latency:.2f}s > Limit: {MAX_TRADE_LATENCY_SECONDS}s.")
                         self.r.xack(TRADE_REQUEST_STREAM, "execution_group", msg_id)
@@ -1006,7 +1006,6 @@ class HybridProducer:
                     info = mt5.account_info()
                     if info:
                         self.ftmo_monitor.equity = info.equity
-                        # REMOVED DEPRECATED CALL: self.ftmo_monitor._check_constraints(0.0)
                         if not self.ftmo_monitor.can_trade():
                             log.warning("Trade blocked by Risk Monitor.")
                             self.r.xack(TRADE_REQUEST_STREAM, "execution_group", msg_id)
@@ -1134,7 +1133,6 @@ class HybridProducer:
                 account_info = mt5.account_info()
                 if not account_info: return False
                 self.ftmo_monitor.equity = account_info.equity
-                # REMOVED DEPRECATED CALL: self.ftmo_monitor._check_constraints(0.0)
                 if not self.ftmo_monitor.can_trade():
                     log.error(f"RISK REJECTION for {symbol}: {self.ftmo_monitor.check_circuit_breakers() if hasattr(self.ftmo_monitor, 'check_circuit_breakers') else 'Circuit Breaker Tripped'}")
                     return False
