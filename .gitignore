@@ -50,6 +50,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+venv_windows/
 
 # Logs
 *.log
@@ -57,3 +58,8 @@ venv.bak/
 # IDE settings
 .vscode/
 .idea/
+
+# Project Artifacts
+models/
+reports/
+logs/
