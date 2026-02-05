@@ -5,10 +5,11 @@
 # DESCRIPTION:
 # The Gateway to the Market.
 #
-# PHOENIX V16.4.2 PATCH (PROTOCOL HARDENING):
-# - BUGFIX: Added strict try-except guards around protocol integer casting.
-# - RESILIENCE: Malformed action codes now trigger a "Poison Pill" ACK to prevent crash loops.
-# - LATENCY: Preserved 5.0s Aggressor Mode latency limit.
+# PHOENIX V16.22 PATCH (REVENGE GUARD - SOURCE OF TRUTH):
+# - CRITICAL FIX: Added '_check_mt5_revenge_status' to query MT5 History directly.
+# - LOGIC: Before executing ANY entry, we check the terminal history. 
+#   If the last closed deal for this symbol was a LOSS within 60 mins, we BLOCK.
+# - ELIMINATES: Race conditions between Linux Engine and Windows Producer.
 # =============================================================================
 import os
 import sys
@@ -935,6 +936,52 @@ class HybridProducer:
                 log.error(f"Trade Listener Generic Error: {e}", exc_info=True)
                 time.sleep(1)
 
+    def _check_mt5_revenge_status(self, symbol: str) -> bool:
+        """
+        V16.22 AUDIT FIX: Direct MT5 History Check.
+        Acts as the 'Single Source of Truth' for Revenge Trading Cooldowns.
+        """
+        try:
+            # 1. Get Configured Cooldown
+            cooldown_mins = CONFIG.get('risk_management', {}).get('loss_cooldown_minutes', 60)
+            if cooldown_mins <= 0: return False
+
+            broker_sym = self.exec_engine.symbol_map.get(symbol, symbol)
+            
+            with self.mt5_lock:
+                # 2. Query History (Local Time)
+                to_date = datetime.now()
+                from_date = to_date - timedelta(minutes=cooldown_mins)
+                
+                # Fetch deals
+                deals = mt5.history_deals_get(symbol=broker_sym, date_from=from_date, date_to=to_date)
+                
+                if deals:
+                    # 3. Analyze recent closures
+                    # Sort by time just in case (MT5 usually returns sorted, but be safe)
+                    sorted_deals = sorted(deals, key=lambda x: x.time, reverse=True)
+                    
+                    for deal in sorted_deals:
+                        # Check Magic Number to ensure it's our bot's trade
+                        if self.exec_engine.magic_number and deal.magic != int(self.exec_engine.magic_number):
+                            continue
+                            
+                        # Look for Exit Deals (Out or In/Out)
+                        if deal.entry in [mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT]:
+                            net_pnl = deal.profit + deal.swap + deal.commission
+                            
+                            if net_pnl < 0:
+                                log.warning(f"🛑 REVENGE GUARD (PRODUCER): {symbol} blocked. Last trade {deal.ticket} was a LOSS ({net_pnl:.2f}) at {datetime.fromtimestamp(deal.time)}.")
+                                return True
+                            else:
+                                # Last trade was a win or break-even, cooldown cleared
+                                return False
+                                
+        except Exception as e:
+            log.error(f"Revenge Guard Check Failed: {e}")
+            
+        return False
+
     def _process_trade_signal_sync(self, msg_id, data):
         """
         V12.21 CRITICAL FIX: Executed synchronously in the Main Thread loop.
@@ -995,6 +1042,12 @@ class HybridProducer:
                             log.warning("Trade blocked by Risk Monitor.")
                             self.r.xack(TRADE_REQUEST_STREAM, "execution_group", msg_id)
                             return
+
+                # --- V16.22 REVENGE GUARD CHECK (SOURCE OF TRUTH) ---
+                if self._check_mt5_revenge_status(symbol):
+                    log.warning(f"⛔ Signal Dropped: {symbol} is in cooldown (MT5 History Check).")
+                    self.r.xack(TRADE_REQUEST_STREAM, "execution_group", msg_id)
+                    return
                 
                 # Determine Type & Action for MT5
                 if action in ["BUY", "SELL"]:
