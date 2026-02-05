@@ -5,10 +5,10 @@
 # DEPENDENCIES: numpy, pandas, scipy (optional on Windows)
 # DESCRIPTION: Core Risk Management logic (Position Sizing, FTMO Limits, HRP).
 #
-# PHOENIX V16.10 UPDATE (MARGIN SAFETY PATCH):
-# 1. LEVERAGE FIX: Updated leverage tiers to match FTMO specs (Forex 1:100, Crypto 1:2).
-# 2. MARGIN BUFFER: Enforces 90% Equity Cap on Used Margin.
-# 3. RECOVERY: Retains Probe Sizing for toxic assets.
+# PHOENIX V16.4 UPDATE (SURVIVAL PROTOCOL):
+# 1. REMOVED ALPHA BOOST: Deleted hardcoded risk multipliers for specific pairs.
+# 2. RISK CAPS: Strict 0.5% hard cap on "Hot Hand" scaling.
+# 3. MARGIN CLAMP: Preserved logic to prevent "Not Enough Money" errors.
 # =============================================================================
 from __future__ import annotations
 import logging
@@ -124,7 +124,7 @@ class RiskManager:
     @staticmethod
     def calculate_required_margin(symbol: str, lots: float, price: float, contract_size: float, conversion_rate: float) -> float:
         """
-        V16.10 FIX: Enforce correct leverage tiers for FTMO/Prop Firms.
+        V16.11 FIX: Enforce correct leverage tiers for FTMO/Prop Firms.
         Formula: (Lots * Contract_Size * Price * Conversion_Rate) / Leverage
         """
         # 1. Identify Asset Class Leverage
@@ -132,15 +132,14 @@ class RiskManager:
         lev_map = risk_conf.get('leverage', {})
         
         # FTMO Standard Leverage (Swing Account is 1:30, Normal is 1:100)
-        # We assume 1:30 to be safe unless specified
+        # We assume 1:30 to be SAFE unless specified
         leverage = float(lev_map.get('default', 30.0))
         
         s = symbol.upper()
         
         # Forex Minors/Crosses often typically 1:100 or 1:30
-        # Check config, default to safe 1:30
         if "JPY" in s and not "USD" in s and not "GBP" in s and not "EUR" in s:
-            leverage = float(lev_map.get('minor', 20.0)) 
+            leverage = float(lev_map.get('minor', 30.0)) 
         
         # Metals (Gold/Silver)
         if "XAU" in s or "XAG" in s:
@@ -166,7 +165,7 @@ class RiskManager:
     @staticmethod
     def _calculate_max_margin_volume(symbol: str, free_margin: float, contract_size: float, price: float, conversion_rate: float) -> float:
         """
-        V16.10: MARGIN CLAMP.
+        V16.11: MARGIN CLAMP.
         Calculates the maximum lot size allowed by available free margin.
         Formula: MaxVol = (FreeMargin * Leverage) / (ContractSize * Price * ConvRate)
         """
@@ -175,13 +174,14 @@ class RiskManager:
         risk_conf = CONFIG.get('risk_management', {})
         lev_map = risk_conf.get('leverage', {})
 
-        # Determine Leverage
+        # Determine Leverage (Consistent with calculate_required_margin)
         lev = float(lev_map.get('default', 30.0))
         s = symbol.upper()
+        
         if "JPY" in s and not "USD" in s and not "GBP" in s and not "EUR" in s:
-            lev = float(lev_map.get('minor', 20.0))
+            lev = float(lev_map.get('minor', 30.0))
         if any(pair in s for pair in ["GBPAUD", "AUDJPY", "EURAUD", "GBPNZD", "GBPJPY"]):
-            lev = float(lev_map.get('minor', 20.0))
+            lev = float(lev_map.get('minor', 30.0))
         if "XAU" in s or "XAG" in s:
             lev = float(lev_map.get('gold', 20.0))
         elif "BTC" in s or "ETH" in s:
@@ -218,11 +218,13 @@ class RiskManager:
         performance_score: float = 0.0, # SQN or Sharpe
         daily_pnl_pct: float = 0.0,
         current_open_risk_pct: float = 0.0,
-        free_margin: float = 999999.0 # V13.1 Update: Passed from Engine
+        free_margin: float = 999999.0 
     ) -> Tuple[Trade, float]:
         """
-        ADVANCED POSITION SIZING KERNEL (V16.10 MARGIN SAFETY).
+        ADVANCED POSITION SIZING KERNEL (V16.4 SURVIVAL PROTOCOL).
         Integrates RCK (Risk-Confidence-Kelly) Optimization with Margin Guards.
+        REMOVED: Alpha Squad Boost (Reckless).
+        ADDED: Strict caps on scaling.
         """
         symbol = context.symbol
         balance = context.account_equity
@@ -275,10 +277,10 @@ class RiskManager:
         lots = 0.0
         calculated_risk_usd = 0.0
         
-        # --- V16.0: HYPER-SCALPER RISK PARAMETERS ---
-        default_base_risk = risk_conf.get('base_risk_per_trade_percent', 0.005) 
+        # --- V16.4: SURVIVAL RISK PARAMETERS ---
+        default_base_risk = risk_conf.get('base_risk_per_trade_percent', 0.0025) # 0.25%
         buffer_threshold = risk_conf.get('profit_buffer_threshold', 0.02)
-        scaled_risk_val = risk_conf.get('scaled_risk_percent', 0.015) 
+        scaled_risk_val = risk_conf.get('scaled_risk_percent', 0.005) # 0.5% Cap
         
         scaling_comment = ""
         
@@ -293,12 +295,11 @@ class RiskManager:
             else:
                 risk_pct = default_base_risk * 100.0
         
-        # --- SQN PERFORMANCE SCALING (V16.3: RECOVERY PATCH) ---
+        # --- SQN PERFORMANCE SCALING (V16.4: CAPPED) ---
         if performance_score != 0.0:
             if performance_score < -2.0:
-                # V16.3 FIX: TOXIC ASSET RECOVERY PROTOCOL
-                # Instead of 0% (Hard Lock), allow 0.1% (Probe)
-                risk_pct = 0.1 
+                # TOXIC ASSET RECOVERY PROTOCOL
+                risk_pct = 0.1 # Probe size
                 scaling_comment += "|Toxic:Probe"
                 
             elif performance_score < 0.0:
@@ -307,20 +308,15 @@ class RiskManager:
                 scaling_comment += "|SQN:Low"
                 
             elif performance_score > 2.5:
-                # HOT HAND: Scale up (V16.0: Max 1.5% for Scalping)
-                risk_pct = min(risk_pct * 1.25, 1.5) 
+                # HOT HAND: Scale up slightly, but HARD CAP at 0.5%
+                risk_pct = min(risk_pct * 1.1, 0.5) 
                 scaling_comment += "|SQN:High"
         
-        # --- ALPHA SQUAD BOOST (V16.0 AGGRESSOR MODE) ---
-        # Added High-Beta Crosses: GBPAUD, EURAUD, GBPNZD
-        if symbol in ["GBPAUD", "EURAUD", "GBPNZD", "GBPJPY", "USDJPY", "GBPUSD"]:
-            boosted_risk = risk_pct * 1.20 
-            if boosted_risk <= 1.5: # V16.0 Cap
-                risk_pct = boosted_risk
-                scaling_comment += "|AlphaBoost"
+        # --- REMOVED ALPHA SQUAD BOOST ---
+        # No arbitrary multipliers based on symbol name. Code must survive on merit.
 
         # --- ASYMPTOTIC DECAY ---
-        daily_limit_pct = risk_conf.get('max_daily_loss_pct', 0.040) # V16.0: 4% Limit
+        daily_limit_pct = risk_conf.get('max_daily_loss_pct', 0.040) 
         
         if daily_pnl_pct < 0:
             current_loss_pct = abs(daily_pnl_pct)
@@ -332,8 +328,8 @@ class RiskManager:
                     risk_pct = max(0.0, decay_risk_pct)
                     scaling_comment += "|Decay:ON"
 
-        # --- V15.0: TOTAL PORTFOLIO RISK CAP ---
-        max_total_risk_pct = float(risk_conf.get('max_risk_percent', 3.0)) # V16.0: 3% Cap
+        # --- TOTAL PORTFOLIO RISK CAP ---
+        max_total_risk_pct = float(risk_conf.get('max_risk_percent', 1.5)) # Reduced cap
         potential_total_risk = current_open_risk_pct + (risk_pct / 100.0) * 100.0 
         
         if potential_total_risk > max_total_risk_pct:
@@ -349,7 +345,7 @@ class RiskManager:
         # Calculate Risk Amount in USD
         calculated_risk_usd = balance * (risk_pct / 100.0)
         
-        # KER Scaling
+        # KER Scaling (Efficiency)
         ker_scalar = max(0.8, min(ker, 1.0))
         calculated_risk_usd *= ker_scalar
         
@@ -362,17 +358,14 @@ class RiskManager:
             penalty_factor = 1.0 / (1.0 + (0.5 * active_correlations))
             lots *= penalty_factor
 
-        # --- V16.10: MARGIN CLAMP (THE FIX) ---
+        # --- MARGIN CLAMP (V16.11) ---
         # Calculate max volume allowed by Free Margin
         max_margin_lots = RiskManager._calculate_max_margin_volume(symbol, free_margin, c_size, price, conversion_rate)
 
         if lots > max_margin_lots:
-            # If our risk-based lot size exceeds our wallet's ability to pay margin, clamp it down.
-            # This prevents "Not Enough Money" errors.
             logger.warning(f"⚠️ MARGIN CLAMP: {symbol} Lots {lots:.2f} -> {max_margin_lots:.2f} (Free Margin ${free_margin:.0f})")
             lots = max_margin_lots
             scaling_comment += "|LevGuard"
-        # -----------------------------------
 
         # --- FINAL HARD LIMITS ---
         min_lot = risk_conf.get('min_lot_size', 0.01)

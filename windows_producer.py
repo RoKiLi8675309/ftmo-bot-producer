@@ -5,10 +5,10 @@
 # DESCRIPTION:
 # The Gateway to the Market.
 #
-# PHOENIX V16.9 PATCH (LATENCY HARDENING):
-# - LATENCY: Reduced MAX_TRADE_LATENCY_SECONDS to 5.0s (Aggressor Mode).
-# - REASON: M5 Scalping requires immediate execution; 60s is too stale.
-# - EXECUTION: Enforced strict MARKET order routing (Price=0.0) to prevent Limit conversion.
+# PHOENIX V16.4.2 PATCH (PROTOCOL HARDENING):
+# - BUGFIX: Added strict try-except guards around protocol integer casting.
+# - RESILIENCE: Malformed action codes now trigger a "Poison Pill" ACK to prevent crash loops.
+# - LATENCY: Preserved 5.0s Aggressor Mode latency limit.
 # =============================================================================
 import os
 import sys
@@ -459,6 +459,7 @@ class MT5ExecutionEngine:
                                     request["price"] = new_tick.ask
                                 elif request["type"] == mt5.ORDER_TYPE_SELL:
                                     request["price"] = new_tick.bid
+                                
                                 request["price"] = PrecisionGuard.normalize_price(request["price"], broker_sym, symbol_info)
 
                 continue
@@ -938,16 +939,16 @@ class HybridProducer:
         """
         V12.21 CRITICAL FIX: Executed synchronously in the Main Thread loop.
         Ensures thread affinity with MT5.
-        V16.9 UPDATE: Added Latency Guard (5s).
+        V16.21 UPDATE: Handled Strict Protocol (Numeric Action Codes).
         """
         try:
             symbol = data['symbol']
-            action = data['action']
+            action = data['action'] # Can be "BUY", "SELL", "1" (Deal), "5" (Pending)
             uuid_val = data.get('uuid')
             
             # V12.19: Capture Price and Type from Payload
             price = float(data.get('price', 0.0))
-            order_type = data.get('type', 'MARKET').upper() # 'LIMIT', 'STOP', or 'MARKET'
+            # Type might be "0" (Buy) or "1" (Sell) if action is numeric
             
             # Latency Check
             request_ts_str = data.get('timestamp')
@@ -980,8 +981,12 @@ class HybridProducer:
                 self.r.sadd("processed_signals", uuid_val)
                 self.r.expire("processed_signals", 3600)
             
-            # --- EXECUTION ---
-            if action in ["BUY", "SELL"]:
+            # --- EXECUTION ROUTING ---
+            
+            # V16.21 FIX: Handle both Legacy ("BUY"/"SELL") and Protocol (1/5) Action Codes
+            is_entry_signal = (action in ["BUY", "SELL"]) or (str(action) in ["1", "5"])
+            
+            if is_entry_signal:
                 with self.mt5_lock:
                     info = mt5.account_info()
                     if info:
@@ -991,26 +996,45 @@ class HybridProducer:
                             self.r.xack(TRADE_REQUEST_STREAM, "execution_group", msg_id)
                             return
                 
+                # Determine Type & Action for MT5
+                if action in ["BUY", "SELL"]:
+                    # Legacy Mapping
+                    order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
+                    order_action = mt5.TRADE_ACTION_DEAL
+                    log_type = action
+                else:
+                    # Protocol Mode: 'type' field contains direction (0=Buy, 1=Sell)
+                    # 'action' field contains execution mode (1=Deal, 5=Pending)
+                    try:
+                        order_type = int(data.get('type', 0))
+                        order_action = int(action)
+                    except (ValueError, TypeError):
+                        log.error(f"❌ MALFORMED PROTOCOL: Action='{action}' or Type='{data.get('type')}' is not integer convertible. Dropping.")
+                        self.r.xack(TRADE_REQUEST_STREAM, "execution_group", msg_id)
+                        return
+
+                    log_type = "BUY" if order_type == mt5.ORDER_TYPE_BUY else "SELL"
+
                 # VERBOSE EXECUTION LOG
-                log.info(f"⚡ EXECUTING {action} {symbol} | Vol: {data['volume']} | Price: {price} | Type: {order_type}")
+                log.info(f"⚡ EXECUTING {log_type} {symbol} | Vol: {data['volume']} | Price: {price} | ActionCode: {order_action}")
                 
                 # V12.37 FIX: EXECUTION LOGIC
-                # If order type is MARKET, force price to 0.0 to trigger Instant Execution in execute_trade
+                # If order type is MARKET/DEAL, force price to 0.0 to trigger Instant Execution in execute_trade
                 exec_price = price
-                if "MARKET" in order_type:
+                if order_action == mt5.TRADE_ACTION_DEAL:
                     exec_price = 0.0
 
                 self.exec_engine.execute_trade({
-                    "action": mt5.TRADE_ACTION_DEAL, # Default to DEAL, execute_trade will upgrade to PENDING if needed
+                    "action": order_action, 
                     "symbol": symbol,
                     "volume": float(data['volume']),
-                    "type": mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL,
-                    "price": exec_price, # Pass 0.0 if Market to force Auto-Price
-                    "sl": float(data.get("stop_loss", 0)), 
-                    "tp": float(data.get("take_profit", 0)),
+                    "type": order_type,
+                    "price": exec_price, 
+                    "sl": float(data.get("sl", 0)), 
+                    "tp": float(data.get("tp", 0)),
                     "magic": MAGIC_NUMBER, 
                     "comment": data.get("comment", "Algo"),
-                    "uuid": uuid_val # V12.35: Pass UUID for idempotency
+                    "uuid": uuid_val 
                 })
             
             elif action == "MODIFY":
@@ -1257,11 +1281,16 @@ class HybridProducer:
             while self.running:
                 try:
                     msg_id, data = self.execution_queue.get(timeout=1)
-                    if "action" in data and data["action"] in ["BUY", "SELL"]:
-                        if not self._validate_risk_synchronous(data["symbol"]):
-                            log.warning(f"Trade blocked by Sync Risk Check: {data['symbol']}")
-                            self.r.xack(TRADE_REQUEST_STREAM, "execution_group", msg_id)
-                            continue
+                    if "action" in data:
+                        # Only run risk check for trade entries (BUY/SELL or 1/5)
+                        act = data["action"]
+                        is_entry = (act in ["BUY", "SELL"]) or (str(act) in ["1", "5"])
+                        
+                        if is_entry:
+                            if not self._validate_risk_synchronous(data["symbol"]):
+                                log.warning(f"Trade blocked by Sync Risk Check: {data['symbol']}")
+                                self.r.xack(TRADE_REQUEST_STREAM, "execution_group", msg_id)
+                                continue
                     
                     # V12.21 FIX: CALL WORKER SYNCHRONOUSLY IN MAIN THREAD
                     # This ensures order_send uses the same thread context as MT5 Init
