@@ -5,11 +5,11 @@
 # DESCRIPTION:
 # The Gateway to the Market.
 #
-# PHOENIX V16.22 PATCH (REVENGE GUARD - SOURCE OF TRUTH):
-# - CRITICAL FIX: Added '_check_mt5_revenge_status' to query MT5 History directly.
-# - LOGIC: Before executing ANY entry, we check the terminal history. 
-#   If the last closed deal for this symbol was a LOSS within 60 mins, we BLOCK.
-# - ELIMINATES: Race conditions between Linux Engine and Windows Producer.
+# PHOENIX V16.25 PATCH (SINGLE SOURCE OF TRUTH - HARD GATE):
+# - CRITICAL FIX: Implemented `_check_hard_trade_limit` inside Execution Engine.
+# - LOGIC: Queries MT5.positions_get() directly before every entry. 
+#   If Count >= Max_Trades (1), the trade is rejected locally.
+# - PURPOSE: Prevents race conditions where Redis lag might allow a second trade.
 # =============================================================================
 import os
 import sys
@@ -84,7 +84,6 @@ KILL_SWITCH_FILE = "kill_switch.lock"
 LIMIT_OFFSET_PIPS = CONFIG['trading'].get('limit_order_offset_pips', 0.2)
 
 # V16.6 SAFETY: Max allowed latency for a signal before it is deemed STALE
-# Reduced to 5.0s for Scalping. Old signals = Adverse Selection.
 MAX_TRADE_LATENCY_SECONDS = 5.0
 
 # Dynamic Timeframe Mapping
@@ -153,10 +152,6 @@ class MT5ExecutionEngine:
             return mt5.terminal_info().connected
 
     def _build_symbol_mapping(self):
-        """
-        Scans all available symbols in MT5 to find the broker-specific name for our config symbols.
-        Example: Config 'EURUSD' -> Broker 'EURUSD.i'
-        """
         log.info("🔍 Scanning for Broker Symbol Suffixes & Forcing Market Watch...")
         with self.lock:
             all_symbols = mt5.symbols_get()
@@ -227,14 +222,10 @@ class MT5ExecutionEngine:
             return info
 
     def _check_idempotency(self, symbol: str, unique_id: str, lookback_sec: int = 60) -> Optional[Dict[str, Any]]:
-        """
-        V12.35 FIX: STRICT IDEMPOTENCY CHECK.
-        Scans comments of Open Positions AND Pending Orders for the unique signal ID.
-        """
         if not unique_id: return None
         
         broker_sym = self.symbol_map.get(symbol, symbol)
-        search_token = unique_id[:8] # MT5 Comment limit safety (Short UUID)
+        search_token = unique_id[:8]
         
         with self.lock:
             # 1. Check Positions (Live Trades)
@@ -255,8 +246,53 @@ class MT5ExecutionEngine:
                         
         return None
 
+    def _check_hard_trade_limit(self, symbol: str) -> bool:
+        """
+        V16.25: HARD SOURCE OF TRUTH CHECK.
+        Queries MT5 Terminal directly for open positions with the bot's Magic Number.
+        If count >= max_open_trades, returns FALSE (Block Trade).
+        This is the ultimate failsafe against multi-trade race conditions.
+        """
+        max_trades = CONFIG['risk_management'].get('max_open_trades', 1)
+        
+        try:
+            with self.lock:
+                # Get ALL positions for this bot (Single Source of Truth)
+                positions = mt5.positions_get()
+                
+                # Check for MT5 Error
+                if positions is None:
+                    log.error("❌ MT5 ERROR: positions_get() returned None. Blocking trade for safety.")
+                    return False
+                
+                # Filter for this bot's magic number
+                bot_positions = [p for p in positions if p.magic == self.magic_number]
+                count = len(bot_positions)
+                
+                # Global Limit Check
+                if count >= max_trades:
+                    log.critical(f"🛑 HARD LIMIT GATE: Live Positions ({count}) >= Limit ({max_trades}). Trade Blocked.")
+                    # Log existing tickets for audit
+                    tickets = [p.ticket for p in bot_positions]
+                    log.info(f"   -> Blocking new trade for {symbol}. Active Tickets: {tickets}")
+                    return False
+                
+                # V16.25: Also verify no pending orders that would breach the limit upon filling
+                orders = mt5.orders_get()
+                if orders:
+                    bot_orders = [o for o in orders if o.magic == self.magic_number]
+                    pending_count = len(bot_orders)
+                    if (count + pending_count) >= max_trades:
+                        log.critical(f"🛑 HARD LIMIT GATE (PENDING): Live ({count}) + Pending ({pending_count}) >= Limit ({max_trades}). Trade Blocked.")
+                        return False
+
+                return True
+                
+        except Exception as e:
+            log.error(f"Hard Limit Check Failed: {e}", exc_info=True)
+            return False # Fail safe: Block if we can't verify
+
     def execute_trade(self, request: Dict[str, Any], max_retries: int = 3) -> Optional[Dict[str, Any]]:
-        # --- VERBOSE REQUEST LOGGING ---
         log.info(f"🏗️ BUILDING ORDER: {request.get('symbol')} {request.get('type')}")
         
         raw_symbol = request.get("symbol")
@@ -274,7 +310,6 @@ class MT5ExecutionEngine:
             log.error(f"EXECUTION FAIL: Could not get symbol_info for {broker_sym}. Is it in Market Watch?")
             return None
         
-        # --- V12.35: EXTRACT UUID FROM COMMENT FOR IDEMPOTENCY ---
         raw_comment = str(request.get("comment", ""))
         signal_uuid = request.get('uuid', '')
         if not signal_uuid and "Auto_" in raw_comment:
@@ -288,13 +323,9 @@ class MT5ExecutionEngine:
                 log.info(f"✅ Trade {signal_uuid} already exists. Skipping duplicate.")
                 return existing
 
-        # --- V16.9 FIX: TYPE SAFE INITIALIZATION ---
         explicit_price = 0.0
-        safe_offset = 0.0
-
         try:
             with self.lock:
-                # Check ALGO TRADING ENABLED
                 term_info = mt5.terminal_info()
                 if not term_info.trade_allowed:
                     log.critical("🚨 ALGO TRADING DISABLED IN TERMINAL! Please enable 'Algo Trading' button in MT5.")
@@ -304,25 +335,16 @@ class MT5ExecutionEngine:
                     log.error(f"EXECUTION FAIL: No tick data for {broker_sym}.")
                     return None
             
-            pip_size = symbol_info.point * 10 if symbol_info.digits == 3 or symbol_info.digits == 5 else symbol_info.point
-            
-            # --- V16.9 CRITICAL FIX: EXPLICIT FLOAT CASTING ---
-            # Dispatcher sends strings ("0.0") to preserve precision.
-            # Comparison operators (>) will crash if we don't cast to float first.
             try:
                 explicit_price = float(request.get("price", 0.0))
             except (ValueError, TypeError):
                 explicit_price = 0.0
             
-            # Check for Market Execution Flag (price is 0.0 or effectively zero)
             is_market_order = (explicit_price < 1e-9)
 
             if not is_market_order:
-                # Explicit Price provided: Respect it (Limit/Stop Logic)
                 request["price"] = PrecisionGuard.normalize_price(explicit_price, broker_sym, symbol_info)
-                # Ensure type is set to PENDING if not already
                 if request["action"] != mt5.TRADE_ACTION_PENDING:
-                    # Infer pending type from price vs market
                     if request["type"] == mt5.ORDER_TYPE_BUY:
                         if request["price"] < tick.ask: request["type"] = mt5.ORDER_TYPE_BUY_LIMIT
                         else: request["type"] = mt5.ORDER_TYPE_BUY_STOP
@@ -333,8 +355,6 @@ class MT5ExecutionEngine:
                     request["action"] = mt5.TRADE_ACTION_PENDING
                     request["type_time"] = mt5.ORDER_TIME_GTC
             else:
-                # Market Order (Price 0.0) -> Instant Execution
-                # V16.9 FIX: Force action to DEAL and price to 0.0 (or current tick for fill estimate)
                 request["action"] = mt5.TRADE_ACTION_DEAL
                 request["type_time"] = mt5.ORDER_TIME_GTC
                 
@@ -345,10 +365,19 @@ class MT5ExecutionEngine:
                 
                 request["price"] = PrecisionGuard.normalize_price(request["price"], broker_sym, symbol_info)
 
-            # --- V16.9 FIX: SAFE FLOAT CASTING FOR ALL NUMERICS ---
+            # --- HARD LIMIT CHECK (SOURCE OF TRUTH) ---
+            # V16.25: Perform the check ONLY for Entries (Deals or Pending Orders)
+            # Do NOT block SL/TP modifications or Close commands
+            if request["action"] in [mt5.TRADE_ACTION_DEAL, mt5.TRADE_ACTION_PENDING]:
+                # We check only if this is a NEW trade logic.
+                # Since closing is done via separate method or CloseBy, simple action check works.
+                # One edge case: Hedging 'Close By' logic uses DEAL action, but we use 'Netting' style logic mostly.
+                # Assuming standard execution:
+                if not self._check_hard_trade_limit(broker_sym):
+                    return None # BLOCK TRADING
+
             raw_vol = float(request.get("volume", 0.01))
             
-            # Volume Normalization
             vol_step = symbol_info.volume_step
             if vol_step > 0:
                 steps = round(raw_vol / vol_step)
@@ -356,7 +385,6 @@ class MT5ExecutionEngine:
             request["volume"] = max(symbol_info.volume_min, min(request["volume"], symbol_info.volume_max))
             request["volume"] = round(request["volume"], 2)
 
-            # SL/TP Normalization
             raw_sl = float(request.get("sl", 0.0))
             if raw_sl > 0:
                 request["sl"] = PrecisionGuard.normalize_price(raw_sl, broker_sym, symbol_info)
@@ -365,17 +393,14 @@ class MT5ExecutionEngine:
             if raw_tp > 0:
                 request["tp"] = PrecisionGuard.normalize_price(raw_tp, broker_sym, symbol_info)
             
-            # Fill Policy
             if request["action"] == mt5.TRADE_ACTION_PENDING:
                 request["type_filling"] = mt5.ORDER_FILLING_RETURN
             else:
                 filling = symbol_info.filling_mode
-                # V16.3 FIX: Use integer constants 1 (FOK) and 2 (IOC) directly to avoid AttributeError
                 if filling & 1: request["type_filling"] = mt5.ORDER_FILLING_FOK
                 elif filling & 2: request["type_filling"] = mt5.ORDER_FILLING_IOC
                 else: request["type_filling"] = mt5.ORDER_FILLING_RETURN
             
-            # Final Type Casting for MT5 C++ Interface
             request['action'] = int(request['action'])
             request['type'] = int(request['type'])
             request['volume'] = float(request['volume'])
@@ -386,7 +411,6 @@ class MT5ExecutionEngine:
             if 'type_time' in request: request['type_time'] = int(request['type_time'])
             if 'type_filling' in request: request['type_filling'] = int(request['type_filling'])
 
-            # --- V12.36 COMMENT SANITIZATION ---
             safe_comment = raw_comment.replace("|", " ").replace(":", " ").replace("%", "").replace("_", "")
             if signal_uuid:
                 short_uuid = signal_uuid[:8]
@@ -402,7 +426,6 @@ class MT5ExecutionEngine:
         # --- EXECUTION LOOP ---
         log.info(f"🚀 SENDING ORDER TO MT5: {json.dumps(request, default=str)}")
         for attempt in range(max_retries):
-            # --- RE-CHECK IDEMPOTENCY ---
             if attempt > 0 and signal_uuid:
                 existing = self._check_idempotency(raw_symbol, signal_uuid)
                 if existing:
@@ -416,7 +439,6 @@ class MT5ExecutionEngine:
                 err = mt5.last_error()
                 log.warning(f"MT5 Order Send returned None. LAST ERROR: {err}. Checking idempotency...")
                 
-                # --- BRUTE FORCE RECONNECT ---
                 log.warning("🔄 FORCING MT5 RECONNECT...")
                 with self.lock:
                     mt5.shutdown()
@@ -439,7 +461,6 @@ class MT5ExecutionEngine:
                 log.info(f"✅ LIMIT ORDER PLACED: {broker_sym} Ticket: {result.order} @ {request['price']}")
                 return result._asdict()
             
-            # --- RETRY LOGIC ---
             elif result.retcode in [mt5.TRADE_RETCODE_REQUOTE, mt5.TRADE_RETCODE_CONNECTION, mt5.TRADE_RETCODE_PRICE_OFF, mt5.TRADE_RETCODE_INVALID_PRICE, 10016]:
                 log.warning(f"Recoverable Error ({result.retcode}). Retrying...")
                 time.sleep(0.5 * (2 ** attempt))
@@ -447,14 +468,9 @@ class MT5ExecutionEngine:
                 with self.lock:
                     new_tick = mt5.symbol_info_tick(broker_sym)
                     if new_tick:
-                        # V12.28 FIX: Re-evaluate Order Type
                         if explicit_price > 0:
-                            # Re-calibrate Pending Logic
-                            base_type = request["type"]
-                            # Logic here assumes type logic from before... simpler to just retry unless price moved massively
                             pass
                         else:
-                            # Market Order update (Chase Price)
                             if request["action"] == mt5.TRADE_ACTION_DEAL:
                                 if request["type"] == mt5.ORDER_TYPE_BUY:
                                     request["price"] = new_tick.ask
@@ -490,7 +506,6 @@ class HybridProducer:
         self.running = True
         self.stop_event = threading.Event()
         
-        # --- DIAGNOSTIC: PROBE REDIS CONNECTION ---
         log.info("🔌 Connecting to Redis...")
         try:
             self.r = get_redis_connection(host=CONFIG['redis']['host'], port=CONFIG['redis']['port'], db=0, decode_responses=True)
@@ -499,7 +514,6 @@ class HybridProducer:
             if val == "alive":
                 log.info(f"✅ REDIS CONNECTED SUCCESSFULLY: {CONFIG['redis']['host']}:{CONFIG['redis']['port']}")
                 
-                # --- V12.20 DIAGNOSTIC: STREAM CHECK ---
                 stream_key = CONFIG['redis']['trade_request_stream']
                 log.info(f"🔌 REDIS CONFIG: Host={CONFIG['redis']['host']} Port={CONFIG['redis']['port']} Stream={stream_key}")
                 
@@ -517,7 +531,6 @@ class HybridProducer:
 
         self.mt5_lock = threading.RLock()
         self.execution_queue = queue.Queue()
-        # V12.21 FIX: Executor removed for Trade operations. Retained only for heavy non-MT5 tasks if needed.
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="BgWorker")
         
         self.db_dsn = CONFIG['postgres']['dsn']
@@ -540,7 +553,11 @@ class HybridProducer:
         
         self.last_tick_state = defaultdict(lambda: {'time_msc': 0, 'volume_real': 0.0})
         self.last_prices = {s: 0.0 for s in SYMBOLS}
-        self.last_deal_scan_time = datetime.now() - timedelta(minutes=1)
+        
+        # V16.23: Initialize last_deal_scan_time to 24h ago in SERVER TIME to ensure we catch up
+        # We'll refine this in the loop once we have the offset
+        self.last_deal_scan_server_ts = 0.0 
+        
         self.run_precise_backfill()
         self._reconstruct_risk_state_from_history()
         self.monitored_symbols = self._ensure_conversion_pairs()
@@ -938,7 +955,8 @@ class HybridProducer:
 
     def _check_mt5_revenge_status(self, symbol: str) -> bool:
         """
-        V16.22 AUDIT FIX: Direct MT5 History Check.
+        V16.23 TIMEZONE FIX: Uses absolute Server Time for history lookups.
+        Prevents missed trades when Local Time != Server Time.
         Acts as the 'Single Source of Truth' for Revenge Trading Cooldowns.
         """
         try:
@@ -949,34 +967,53 @@ class HybridProducer:
             broker_sym = self.exec_engine.symbol_map.get(symbol, symbol)
             
             with self.mt5_lock:
-                # 2. Query History (Local Time)
-                to_date = datetime.now()
-                from_date = to_date - timedelta(minutes=cooldown_mins)
+                # 2. Calculate Server Time Window (Epoch)
+                # deal.time in MT5 is Epoch Seconds (Server Time)
+                # We must use SERVER TIME for current time, NOT Local Time.
                 
-                # Fetch deals
-                deals = mt5.history_deals_get(symbol=broker_sym, date_from=from_date, date_to=to_date)
+                # Current Server Time derived from offset
+                server_now_ts = time.time() + self.exec_engine.broker_time_offset
+                
+                # Fetch history using wide buffers to avoid Timezone clipping issues
+                # Look back 24 hours to be safe, filtering happens in Python
+                from_ts = server_now_ts - 86400 
+                to_ts = server_now_ts + 3600 # Future buffer
+                
+                # Fetch deals using FLOAT timestamps (mt5 treats floats as epoch)
+                deals = mt5.history_deals_get(float(from_ts), float(to_ts))
                 
                 if deals:
-                    # 3. Analyze recent closures
-                    # Sort by time just in case (MT5 usually returns sorted, but be safe)
-                    sorted_deals = sorted(deals, key=lambda x: x.time, reverse=True)
+                    # Filter for symbol and our bot's magic number
+                    relevant_deals = [
+                        d for d in deals 
+                        if d.symbol == broker_sym and d.magic == int(self.exec_engine.magic_number)
+                    ]
+                    
+                    # Sort by time descending (Newest first)
+                    sorted_deals = sorted(relevant_deals, key=lambda x: x.time, reverse=True)
                     
                     for deal in sorted_deals:
-                        # Check Magic Number to ensure it's our bot's trade
-                        if self.exec_engine.magic_number and deal.magic != int(self.exec_engine.magic_number):
-                            continue
+                        # Check if this deal is within the strict cooldown window
+                        time_since_close = server_now_ts - deal.time
+                        
+                        # Debug Log for diagnostic
+                        # log.info(f"AUDIT {symbol}: Deal {deal.ticket} closed {time_since_close:.1f}s ago. PnL: {deal.profit}")
+
+                        if time_since_close < (cooldown_mins * 60):
+                            # Check if it was an Exit Deal (Out or In/Out)
+                            if deal.entry in [mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT]:
+                                net_pnl = deal.profit + deal.swap + deal.commission
+                                if net_pnl < 0:
+                                    expiry_in = int((cooldown_mins * 60) - time_since_close)
+                                    log.warning(f"🛑 REVENGE GUARD: {symbol} BLOCKED. Loss {net_pnl:.2f} at {deal.time} (Server Time). Expiry in {expiry_in}s")
+                                    return True
+                                else:
+                                    # Last trade was a win/breakeven, reset cooldown
+                                    return False
+                        else:
+                            # We reached a deal older than cooldown, stop checking
+                            break
                             
-                        # Look for Exit Deals (Out or In/Out)
-                        if deal.entry in [mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT]:
-                            net_pnl = deal.profit + deal.swap + deal.commission
-                            
-                            if net_pnl < 0:
-                                log.warning(f"🛑 REVENGE GUARD (PRODUCER): {symbol} blocked. Last trade {deal.ticket} was a LOSS ({net_pnl:.2f}) at {datetime.fromtimestamp(deal.time)}.")
-                                return True
-                            else:
-                                # Last trade was a win or break-even, cooldown cleared
-                                return False
-                                
         except Exception as e:
             log.error(f"Revenge Guard Check Failed: {e}")
             
@@ -1116,12 +1153,23 @@ class HybridProducer:
                 self.exec_engine.close_position(p.ticket, p.symbol, p.volume, p.type)
 
     def _closed_trade_monitor(self):
-        log.info("Starting Closed Trade Monitor (SQN Feed)...")
+        log.info("Starting Closed Trade Monitor (SQN Feed - Server Time Sync)...")
+        # Initialize last scan time based on SERVER TIME
+        if not self.last_deal_scan_server_ts:
+            # First run: Look back 24 hours just in case we missed something during restart
+            self.last_deal_scan_server_ts = (time.time() + self.exec_engine.broker_time_offset) - 86400
+            
         while self.running and not self.stop_event.is_set():
             try:
-                now = datetime.now()
-                with self.mt5_lock: deals = mt5.history_deals_get(self.last_deal_scan_time, now)
-                self.last_deal_scan_time = now
+                # Calculate current server time
+                server_now_ts = time.time() + self.exec_engine.broker_time_offset
+                
+                with self.mt5_lock: 
+                    # Use Timestamp based queries
+                    deals = mt5.history_deals_get(float(self.last_deal_scan_server_ts), float(server_now_ts + 60))
+                
+                self.last_deal_scan_server_ts = server_now_ts
+                
                 if deals:
                     pipe = self.r.pipeline()
                     published_count = 0
@@ -1132,7 +1180,7 @@ class HybridProducer:
                                 "symbol": deal.symbol, "ticket": deal.ticket,
                                 "position_id": deal.position_id, "net_pnl": float(net_pnl),
                                 "close_price": deal.price, "reason": deal.reason,
-                                "timestamp": deal.time
+                                "timestamp": deal.time # Server Time
                             }
                             pipe.xadd(CLOSED_TRADE_STREAM, payload, maxlen=1000, approximate=True)
                             published_count += 1
