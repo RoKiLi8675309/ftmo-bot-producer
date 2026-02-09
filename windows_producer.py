@@ -10,6 +10,11 @@
 # - LOGIC: Queries MT5.positions_get() directly before every entry. 
 #   If Count >= Max_Trades (1), the trade is rejected locally.
 # - PURPOSE: Prevents race conditions where Redis lag might allow a second trade.
+#
+# AUDIT FIX V16.4.1 (DATA STARVATION PATCH):
+# - CRITICAL: Now streams ticks for AUX_SYMBOLS (e.g. NZDUSD) to Redis.
+# - REASON: Linux Engine needs these ticks to update conversion rates for 
+#   Cross-Pairs (e.g. GBPNZD) even if we don't trade the Aux pair itself.
 # =============================================================================
 import os
 import sys
@@ -371,8 +376,6 @@ class MT5ExecutionEngine:
             if request["action"] in [mt5.TRADE_ACTION_DEAL, mt5.TRADE_ACTION_PENDING]:
                 # We check only if this is a NEW trade logic.
                 # Since closing is done via separate method or CloseBy, simple action check works.
-                # One edge case: Hedging 'Close By' logic uses DEAL action, but we use 'Netting' style logic mostly.
-                # Assuming standard execution:
                 if not self._check_hard_trade_limit(broker_sym):
                     return None # BLOCK TRADING
 
@@ -837,9 +840,12 @@ class HybridProducer:
                             "ctx_d1": json.dumps(self.d1_cache.get(sym, {})),
                             "ctx_h4": json.dumps(self.h4_cache.get(sym, {}))
                         }
-                        if sym in SYMBOLS: 
-                            pipe.xadd(STREAM_KEY, payload, maxlen=10000, approximate=True)
-                            updates_count += 1
+                        # AUDIT FIX V16.4.1: Stream ALL monitored symbols (including Aux)
+                        # This ensures the Linux Engine gets price updates for conversion pairs (e.g. NZDUSD)
+                        # even if they are not primary trading symbols.
+                        pipe.xadd(STREAM_KEY, payload, maxlen=10000, approximate=True)
+                        updates_count += 1
+                        
                         key = self.monitored_price_keys.get(sym, f"price:{sym}")
                         pipe.hset(key, mapping={"bid": payload["bid"], "ask": payload["ask"], "time": int(utc_ts/1000)})
                 if updates_count > 0:
