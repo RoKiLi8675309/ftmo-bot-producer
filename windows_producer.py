@@ -67,7 +67,6 @@ TRADE_REQUEST_STREAM = CONFIG['redis']['trade_request_stream']
 CLOSED_TRADE_STREAM = CONFIG['redis'].get('closed_trade_stream_key', 'stream:closed_trades')
 MAGIC_NUMBER = CONFIG['trading']['magic_number']
 KILL_SWITCH_FILE = "kill_switch.lock"
-LIMIT_OFFSET_PIPS = CONFIG['trading'].get('limit_order_offset_pips', 0.2)
 
 # Safety: Max allowed latency for a signal before it is deemed STALE
 MAX_TRADE_LATENCY_SECONDS = 5.0
@@ -311,7 +310,9 @@ class MT5ExecutionEngine:
                 log.info(f"✅ Trade {signal_uuid} already exists. Skipping duplicate.")
                 return existing
 
-        explicit_price = 0.0
+        # --- FORCE MARKET EXECUTION (AGGRESSOR PROTOCOL) ---
+        # No more limit logic. Always execute at market.
+        
         try:
             with self.lock:
                 term_info = mt5.terminal_info()
@@ -323,29 +324,12 @@ class MT5ExecutionEngine:
                     log.error(f"EXECUTION FAIL: No tick data for {broker_sym}.")
                     return None
             
-            try:
-                explicit_price = float(request.get("price", 0.0))
-            except (ValueError, TypeError):
-                explicit_price = 0.0
-            
-            is_market_order = (explicit_price < 1e-9)
-
-            if not is_market_order:
-                request["price"] = PrecisionGuard.normalize_price(explicit_price, broker_sym, symbol_info)
-                if request["action"] != mt5.TRADE_ACTION_PENDING:
-                    if request["type"] == mt5.ORDER_TYPE_BUY:
-                        if request["price"] < tick.ask: request["type"] = mt5.ORDER_TYPE_BUY_LIMIT
-                        else: request["type"] = mt5.ORDER_TYPE_BUY_STOP
-                    elif request["type"] == mt5.ORDER_TYPE_SELL:
-                        if request["price"] > tick.bid: request["type"] = mt5.ORDER_TYPE_SELL_LIMIT
-                        else: request["type"] = mt5.ORDER_TYPE_SELL_STOP
-                    
-                    request["action"] = mt5.TRADE_ACTION_PENDING
-                    request["type_time"] = mt5.ORDER_TIME_GTC
-            else:
+            # --- MARKET ORDER CONSTRUCTION ---
+            if request["action"] != mt5.TRADE_ACTION_SLTP: # Don't override SL/TP modifications
                 request["action"] = mt5.TRADE_ACTION_DEAL
                 request["type_time"] = mt5.ORDER_TIME_GTC
                 
+                # ALWAYS use current tick price for Market Execution
                 if request["type"] == mt5.ORDER_TYPE_BUY:
                     request["price"] = tick.ask
                 elif request["type"] == mt5.ORDER_TYPE_SELL:
@@ -376,7 +360,9 @@ class MT5ExecutionEngine:
             if raw_tp > 0:
                 request["tp"] = PrecisionGuard.normalize_price(raw_tp, broker_sym, symbol_info)
             
+            # Since we are MARKET ONLY, filling type is usually FOK or IOC
             if request["action"] == mt5.TRADE_ACTION_PENDING:
+                 # Should not happen in Market Only mode, but kept for safety if Pending passed manually
                 request["type_filling"] = mt5.ORDER_FILLING_RETURN
             else:
                 filling = symbol_info.filling_mode
@@ -458,16 +444,14 @@ class MT5ExecutionEngine:
                     with self.lock:
                         new_tick = mt5.symbol_info_tick(broker_sym)
                         if new_tick:
-                            if explicit_price > 0:
-                                pass
-                            else:
-                                if request["action"] == mt5.TRADE_ACTION_DEAL:
-                                    if request["type"] == mt5.ORDER_TYPE_BUY:
-                                        request["price"] = new_tick.ask
-                                    elif request["type"] == mt5.ORDER_TYPE_SELL:
-                                        request["price"] = new_tick.bid
-                                    
-                                    request["price"] = PrecisionGuard.normalize_price(request["price"], broker_sym, symbol_info)
+                            # REFRESH PRICE FOR RETRY
+                            if request["action"] == mt5.TRADE_ACTION_DEAL:
+                                if request["type"] == mt5.ORDER_TYPE_BUY:
+                                    request["price"] = new_tick.ask
+                                elif request["type"] == mt5.ORDER_TYPE_SELL:
+                                    request["price"] = new_tick.bid
+                                
+                                request["price"] = PrecisionGuard.normalize_price(request["price"], broker_sym, symbol_info)
 
                     continue
                 else:
@@ -1030,14 +1014,16 @@ class HybridProducer:
                         if time_since_close < (cooldown_mins * 60):
                             if deal.entry in [mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT]:
                                 net_pnl = deal.profit + deal.swap + deal.commission
+                                expiry_in = int((cooldown_mins * 60) - time_since_close)
+                                
                                 if net_pnl < 0:
-                                    expiry_in = int((cooldown_mins * 60) - time_since_close)
                                     log.warning(f"🛑 REVENGE GUARD: {symbol} BLOCKED. Loss {net_pnl:.2f} at {deal.time} (Server Time). Expiry in {expiry_in}s")
-                                    return True
                                 else:
-                                    # Last trade was a win/breakeven, reset cooldown
-                                    return False
+                                    log.warning(f"🛡️ MANDATORY COOLDOWN: {symbol} BLOCKED. Win/BE {net_pnl:.2f} at {deal.time}. Expiry in {expiry_in}s")
+                                
+                                return True # Block ALL trades within window
                         else:
+                            # Found a deal outside window, and since sorted, older ones are also outside
                             break
                             
         except Exception as e:
