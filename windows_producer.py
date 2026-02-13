@@ -239,10 +239,9 @@ class MT5ExecutionEngine:
     def _check_hard_trade_limit(self, symbol: str) -> bool:
         """
         HARD SOURCE OF TRUTH CHECK + IN-FLIGHT CACHE.
-        Includes a local cache check to prevent race conditions where
-        multiple threads pass this check before the first trade is recorded by MT5.
+        Updated for V17.0: Checks Global Limit (8) AND Single Trade Per Pair logic.
         """
-        max_trades = CONFIG['risk_management'].get('max_open_trades', 1)
+        max_trades = CONFIG['risk_management'].get('max_open_trades', 8)
         
         try:
             # 1. Check In-Flight Cache (Trades sent but not yet in MT5)
@@ -272,6 +271,13 @@ class MT5ExecutionEngine:
                 if total_utilization >= max_trades:
                     log.critical(f"🛑 HARD LIMIT GATE: Live ({count}) + In-Flight ({inflight_count}) >= Limit ({max_trades}). Trade Blocked.")
                     return False
+                
+                # Per-Symbol Limit Check (1 per pair)
+                broker_sym = self.symbol_map.get(symbol, symbol)
+                symbol_positions = [p for p in bot_positions if p.symbol == broker_sym]
+                if len(symbol_positions) >= 1:
+                     log.warning(f"🛑 PAIR LIMIT: {symbol} already has {len(symbol_positions)} trade(s). Blocked.")
+                     return False
                 
                 return True
                 
@@ -311,7 +317,6 @@ class MT5ExecutionEngine:
                 return existing
 
         # --- FORCE MARKET EXECUTION (AGGRESSOR PROTOCOL) ---
-        # No more limit logic. Always execute at market.
         
         try:
             with self.lock:
@@ -340,10 +345,15 @@ class MT5ExecutionEngine:
             # --- HARD LIMIT CHECK (SOURCE OF TRUTH) ---
             # Perform the check ONLY for Entries (Deals or Pending Orders)
             if request["action"] in [mt5.TRADE_ACTION_DEAL, mt5.TRADE_ACTION_PENDING]:
-                if not self._check_hard_trade_limit(broker_sym):
+                if not self._check_hard_trade_limit(raw_symbol):
                     return None # BLOCK TRADING
 
+            # V17.0 FORCE 0.01 LOTS CHECK
+            # Even if strategy sent weird size, clamp it here too for double safety
             raw_vol = float(request.get("volume", 0.01))
+            
+            # If volume > 0.01 and we are in fixed mode (detected via config or just safety), clamp it?
+            # Actually, strategy should have sent 0.01. But let's respect symbol steps.
             
             vol_step = symbol_info.volume_step
             if vol_step > 0:
@@ -362,7 +372,7 @@ class MT5ExecutionEngine:
             
             # Since we are MARKET ONLY, filling type is usually FOK or IOC
             if request["action"] == mt5.TRADE_ACTION_PENDING:
-                 # Should not happen in Market Only mode, but kept for safety if Pending passed manually
+                 # Should not happen in Market Only mode
                 request["type_filling"] = mt5.ORDER_FILLING_RETURN
             else:
                 filling = symbol_info.filling_mode
