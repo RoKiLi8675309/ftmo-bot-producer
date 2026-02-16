@@ -239,7 +239,7 @@ class MT5ExecutionEngine:
     def _check_hard_trade_limit(self, symbol: str) -> bool:
         """
         HARD SOURCE OF TRUTH CHECK + IN-FLIGHT CACHE.
-        Updated for V17.0: Checks Global Limit (8) AND Single Trade Per Pair logic.
+        Updated for V17.0: Checks Global Limit (8) AND Pyramiding Logic.
         """
         max_trades = CONFIG['risk_management'].get('max_open_trades', 8)
         
@@ -272,11 +272,18 @@ class MT5ExecutionEngine:
                     log.critical(f"🛑 HARD LIMIT GATE: Live ({count}) + In-Flight ({inflight_count}) >= Limit ({max_trades}). Trade Blocked.")
                     return False
                 
-                # Per-Symbol Limit Check (1 per pair)
+                # Per-Symbol Limit Check
+                # V17.0 UPDATE: Allow multiple trades if Pyramiding is enabled in Config
+                is_pyramid_enabled = CONFIG.get('risk_management', {}).get('pyramiding', {}).get('enabled', False)
+                
+                # If enabled, allow up to 3 trades per symbol (Base + 2 Adds). If disabled, strict 1 per pair.
+                max_per_symbol = 3 if is_pyramid_enabled else 1
+
                 broker_sym = self.symbol_map.get(symbol, symbol)
                 symbol_positions = [p for p in bot_positions if p.symbol == broker_sym]
-                if len(symbol_positions) >= 1:
-                     log.warning(f"🛑 PAIR LIMIT: {symbol} already has {len(symbol_positions)} trade(s). Blocked.")
+                
+                if len(symbol_positions) >= max_per_symbol:
+                     log.warning(f"🛑 PAIR LIMIT: {symbol} already has {len(symbol_positions)} trade(s) (Max {max_per_symbol}). Blocked.")
                      return False
                 
                 return True
@@ -350,17 +357,15 @@ class MT5ExecutionEngine:
 
             # V17.0 FORCE 0.01 LOTS CHECK
             # Even if strategy sent weird size, clamp it here too for double safety
-            raw_vol = float(request.get("volume", 0.01))
-            
-            # If volume > 0.01 and we are in fixed mode (detected via config or just safety), clamp it?
-            # Actually, strategy should have sent 0.01. But let's respect symbol steps.
-            
-            vol_step = symbol_info.volume_step
-            if vol_step > 0:
-                steps = round(raw_vol / vol_step)
-                request["volume"] = steps * vol_step
-            request["volume"] = max(symbol_info.volume_min, min(request["volume"], symbol_info.volume_max))
-            request["volume"] = round(request["volume"], 2)
+            if "volume" in request:
+                raw_vol = float(request.get("volume", 0.01))
+                
+                vol_step = symbol_info.volume_step
+                if vol_step > 0:
+                    steps = round(raw_vol / vol_step)
+                    request["volume"] = steps * vol_step
+                request["volume"] = max(symbol_info.volume_min, min(request["volume"], symbol_info.volume_max))
+                request["volume"] = round(request["volume"], 2)
 
             raw_sl = float(request.get("sl", 0.0))
             if raw_sl > 0:
@@ -375,15 +380,22 @@ class MT5ExecutionEngine:
                  # Should not happen in Market Only mode
                 request["type_filling"] = mt5.ORDER_FILLING_RETURN
             else:
+                # Filling Mode Handling
                 filling = symbol_info.filling_mode
-                if filling & 1: request["type_filling"] = mt5.ORDER_FILLING_FOK
-                elif filling & 2: request["type_filling"] = mt5.ORDER_FILLING_IOC
-                else: request["type_filling"] = mt5.ORDER_FILLING_RETURN
+                if filling == 0:
+                    # Some brokers don't set filling_mode correctly, assume IOC for market
+                    request["type_filling"] = mt5.ORDER_FILLING_IOC
+                elif filling & 1: 
+                    request["type_filling"] = mt5.ORDER_FILLING_FOK
+                elif filling & 2: 
+                    request["type_filling"] = mt5.ORDER_FILLING_IOC
+                else: 
+                    request["type_filling"] = mt5.ORDER_FILLING_RETURN
             
             request['action'] = int(request['action'])
-            request['type'] = int(request['type'])
-            request['volume'] = float(request['volume'])
-            request['price'] = float(request['price'])
+            if 'type' in request: request['type'] = int(request['type'])
+            if 'volume' in request: request['volume'] = float(request['volume'])
+            if 'price' in request: request['price'] = float(request['price'])
             if 'sl' in request: request['sl'] = float(request['sl'])
             if 'tp' in request: request['tp'] = float(request['tp'])
             if 'magic' in request: request['magic'] = int(request['magic'])
@@ -477,18 +489,47 @@ class MT5ExecutionEngine:
                     self.inflight_orders.discard(signal_uuid)
 
     def close_position(self, position_id: int, symbol: str, volume: float, pos_type: int) -> Optional[Any]:
+        """
+        Closes a specific position by ticket.
+        Enhanced with logging to debug 'CLOSE_ALL' loops.
+        """
         with self.lock:
             tick = mt5.symbol_info_tick(symbol)
-            if not tick: return None
+            if not tick: 
+                log.error(f"❌ CLOSE FAIL: No tick for {symbol}")
+                return None
+            
+            # Determine close price (Bid for Buy, Ask for Sell)
             price = tick.bid if pos_type == mt5.ORDER_TYPE_BUY else tick.ask
+            # Determine close type (Sell for Buy, Buy for Sell)
             trade_type = mt5.ORDER_TYPE_SELL if pos_type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+            
             request = {
-                "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": volume,
-                "type": trade_type, "position": position_id, "price": price,
-                "deviation": self.default_deviation, "magic": self.magic_number,
-                "comment": "Algo Close", "type_time": mt5.ORDER_TIME_GTC, "type_filling": mt5.ORDER_FILLING_IOC
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": volume,
+                "type": trade_type,
+                "position": position_id,
+                "price": price,
+                "deviation": self.default_deviation,
+                "magic": self.magic_number,
+                "comment": "Algo Close",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC
             }
-            return mt5.order_send(request)
+            
+            result = mt5.order_send(request)
+            
+            if result is None:
+                log.error(f"❌ CLOSE ERROR: mt5.order_send returned None for {symbol} Ticket:{position_id}")
+                return None
+                
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                log.error(f"❌ CLOSE FAILED: {symbol} Ticket:{position_id} Ret:{result.retcode} ({result.comment})")
+            else:
+                log.info(f"✅ CLOSE SUCCESS: {symbol} Ticket:{position_id} Closed at {price}")
+                
+            return result
 
 class HybridProducer:
     def __init__(self):
@@ -1137,9 +1178,14 @@ class HybridProducer:
                 })
             
             elif action == "MODIFY":
+                # FIXED: Added 'symbol' and 'magic' to the request dictionary
                 self.exec_engine.execute_trade({
-                    "action": mt5.TRADE_ACTION_SLTP, "position": int(data['ticket']),
-                    "sl": float(data.get("sl", 0)), "tp": float(data.get("tp", 0))
+                    "action": mt5.TRADE_ACTION_SLTP, 
+                    "symbol": symbol,  # <--- CRITICAL FIX
+                    "position": int(data['ticket']),
+                    "sl": float(data.get("sl", 0)), 
+                    "tp": float(data.get("tp", 0)),
+                    "magic": self.exec_engine.magic_number
                 })
             
             elif action == "CLOSE_ALL": 
@@ -1156,7 +1202,12 @@ class HybridProducer:
                 positions = mt5.positions_get(symbol=broker_sym)
             else:
                 positions = mt5.positions_get()
-            if not positions: return
+            
+            if not positions: 
+                log.info(f"ℹ️ No positions found to close for {symbol if symbol else 'ALL'}.")
+                return
+
+            log.info(f"🚨 CLOSING {len(positions)} POSITIONS for {symbol if symbol else 'ALL'}...")
             for p in positions:
                 if p.magic != MAGIC_NUMBER: continue
                 self.exec_engine.close_position(p.ticket, p.symbol, p.volume, p.type)
