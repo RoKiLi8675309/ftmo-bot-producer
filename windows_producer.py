@@ -566,7 +566,11 @@ class HybridProducer:
         self.db_dsn = CONFIG['postgres']['dsn']
         self._connect_db_with_retry()
         initial_bal = CONFIG.get('env', {}).get('initial_balance', 100000.0)
-        self.ftmo_monitor = FTMORiskMonitor(initial_balance=initial_bal, max_daily_loss_pct=CONFIG['risk_management']['max_daily_loss_pct'], redis_client=self.r)
+        
+        # --- FIX: SAFE CONFIG LOOKUP FOR max_daily_loss_pct ---
+        max_daily_loss = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.045)
+        self.ftmo_monitor = FTMORiskMonitor(initial_balance=initial_bal, max_daily_loss_pct=max_daily_loss, redis_client=self.r)
+        
         self._optimize_process()
         self.connect_mt5()
         self.exec_engine = MT5ExecutionEngine(self.r, self.mt5_lock, self.ftmo_monitor)
@@ -688,7 +692,10 @@ class HybridProducer:
                     if abs(self.ftmo_monitor.initial_balance - current_balance) > (current_balance * 0.01):
                         log.warning(f"⚠️ Auto-Detecting Account Size: Config ({self.ftmo_monitor.initial_balance}) != Broker ({current_balance}). Updating Risk Limits.")
                         self.ftmo_monitor.initial_balance = current_balance
-                        self.ftmo_monitor.max_daily_loss = current_balance * CONFIG['risk_management']['max_daily_loss_pct']
+                        
+                        # --- FIX: SAFE CONFIG LOOKUP FOR max_daily_loss_pct ---
+                        safe_loss_pct = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.045)
+                        self.ftmo_monitor.max_daily_loss = current_balance * safe_loss_pct
                     
                     # AUDIT FIX: Get Accurate Midnight Anchor using Broker Time
                     # We need the current Server Time.
@@ -735,7 +742,9 @@ class HybridProducer:
                     # Persist the Anchor Date to allow Engine to detect rollover
                     self.r.set("risk:last_reset_date", str(midnight_ts)) 
                     
-                    loss_limit = calculated_start * CONFIG['risk_management']['max_daily_loss_pct']
+                    # --- FIX: SAFE CONFIG LOOKUP FOR max_daily_loss_pct ---
+                    safe_loss_pct = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.045)
+                    loss_limit = calculated_start * safe_loss_pct
                     hard_deck = calculated_start - loss_limit
                     self.r.set("risk:hard_deck_level", hard_deck)
                     log.info(f"{LogSymbols.SUCCESS} RISK STATE VERIFIED: Start Equity: {calculated_start:.2f} | Hard Deck: {hard_deck:.2f} | PnL Today: {realized_pnl_today:.2f} (Timezone: {risk_tz_str})")
@@ -1335,7 +1344,8 @@ class HybridProducer:
             if (hour == 23 and minute >= 55) or (hour == 0 and minute <= 5):
                 self.r.set(freeze_key, "1")
                 
-                current_midnight_id = int(server_ts / 86400) # Epoch days as ID
+                # V17.5 FIX: String date as ID, respects Risk TZ
+                current_midnight_id = dt_risk.strftime("%Y-%m-%d") 
                 
                 if hour == 0 and minute == 0 and current_midnight_id != last_anchor_id:
                     log.warning(f"⚓ MIDNIGHT ANCHOR ({risk_tz_str}): Capturing Daily Starting Equity...")
@@ -1346,7 +1356,9 @@ class HybridProducer:
                             if info:
                                 start_equity = info.equity
                                 self.r.set(daily_start_key, start_equity)
-                                max_loss_pct = CONFIG['risk_management']['max_daily_loss_pct']
+                                
+                                # --- FIX: SAFE CONFIG LOOKUP FOR max_daily_loss_pct ---
+                                max_loss_pct = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.045)
                                 loss_limit = start_equity * max_loss_pct
                                 hard_deck = start_equity - loss_limit
                                 self.r.set(hard_deck_key, hard_deck)
