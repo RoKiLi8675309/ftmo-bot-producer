@@ -138,8 +138,44 @@ class MT5ExecutionEngine:
 
     def _check_connection(self) -> bool:
         """Checks connection with a timeout guard."""
-        # Note: We avoid holding the main lock here to prevent deadlocks if MT5 hangs
         return mt5.terminal_info().connected
+
+    # --- V20.2 IPC ROBUSTNESS WRAPPERS ---
+    def _safe_positions_get(self, symbol: Optional[str] = None, max_retries: int = 3) -> Optional[tuple]:
+        """Safely fetches positions with retry logic against MT5 IPC drops."""
+        for attempt in range(max_retries):
+            positions = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
+            if positions is not None:
+                return positions
+            err = mt5.last_error()
+            log.warning(f"⚠️ mt5.positions_get() returned None. Error: {err}. Retry {attempt+1}/{max_retries}")
+            time.sleep(0.5)
+        log.error(f"❌ CRITICAL: mt5.positions_get() failed after {max_retries} retries.")
+        return None
+
+    def _safe_orders_get(self, symbol: Optional[str] = None, max_retries: int = 3) -> Optional[tuple]:
+        """Safely fetches pending orders with retry logic against MT5 IPC drops."""
+        for attempt in range(max_retries):
+            orders = mt5.orders_get(symbol=symbol) if symbol else mt5.orders_get()
+            if orders is not None:
+                return orders
+            err = mt5.last_error()
+            log.warning(f"⚠️ mt5.orders_get() returned None. Error: {err}. Retry {attempt+1}/{max_retries}")
+            time.sleep(0.5)
+        log.error(f"❌ CRITICAL: mt5.orders_get() failed after {max_retries} retries.")
+        return None
+
+    def _safe_account_info(self, max_retries: int = 3) -> Optional[Any]:
+        """Safely fetches account info with retry logic against MT5 IPC drops."""
+        for attempt in range(max_retries):
+            info = mt5.account_info()
+            if info is not None:
+                return info
+            err = mt5.last_error()
+            log.warning(f"⚠️ mt5.account_info() returned None. Error: {err}. Retry {attempt+1}/{max_retries}")
+            time.sleep(0.5)
+        log.error(f"❌ CRITICAL: mt5.account_info() failed after {max_retries} retries.")
+        return None
 
     def _build_symbol_mapping(self):
         log.info("🔍 Scanning for Broker Symbol Suffixes & Forcing Market Watch...")
@@ -218,16 +254,16 @@ class MT5ExecutionEngine:
         search_token = unique_id[:8]
         
         with self.lock:
-            # 1. Check Positions (Live Trades)
-            positions = mt5.positions_get(symbol=broker_sym)
+            # 1. Check Positions (Live Trades) - V20.2 Safe Fetch
+            positions = self._safe_positions_get(symbol=broker_sym)
             if positions:
                 for pos in positions:
                     if search_token in pos.comment:
                         log.warning(f"🛑 IDEMPOTENCY GUARD: Signal {unique_id} already executing as Position {pos.ticket}.")
                         return {"retcode": mt5.TRADE_RETCODE_DONE, "order": pos.ticket, "price": pos.price_open}
             
-            # 2. Check Orders (Pending Limits/Stops)
-            orders = mt5.orders_get(symbol=broker_sym)
+            # 2. Check Orders (Pending Limits/Stops) - V20.2 Safe Fetch
+            orders = self._safe_orders_get(symbol=broker_sym)
             if orders:
                 for order in orders:
                     if search_token in order.comment:
@@ -237,14 +273,10 @@ class MT5ExecutionEngine:
         return None
 
     def _check_hard_trade_limit(self, symbol: str) -> bool:
-        """
-        HARD SOURCE OF TRUTH CHECK + IN-FLIGHT CACHE.
-        Updated for V17.0: Checks Global Limit (8) AND Pyramiding Logic.
-        """
-        max_trades = CONFIG['risk_management'].get('max_open_trades', 8)
+        max_trades = CONFIG.get('risk_management', {}).get('max_open_trades', 4)
         
         try:
-            # 1. Check In-Flight Cache (Trades sent but not yet in MT5)
+            # 1. Check In-Flight Cache
             with self.inflight_lock:
                 inflight_count = len(self.inflight_orders)
                 if inflight_count >= max_trades:
@@ -252,20 +284,16 @@ class MT5ExecutionEngine:
                     return False
 
             with self.lock:
-                # 2. Get ALL positions for this bot (Single Source of Truth)
-                positions = mt5.positions_get()
+                # 2. Get ALL positions for this bot - V20.2 Safe Fetch
+                positions = self._safe_positions_get()
                 
-                # Check for MT5 Error - FAIL CLOSED
                 if positions is None:
-                    err = mt5.last_error()
-                    log.error(f"❌ MT5 ERROR: positions_get() returned None. Error: {err}. Blocking trade for safety.")
+                    log.error(f"❌ MT5 ERROR: positions_get() returned None. Blocking trade for safety.")
                     return False
                 
-                # Filter for this bot's magic number
                 bot_positions = [p for p in positions if p.magic == self.magic_number]
                 count = len(bot_positions)
                 
-                # Global Limit Check
                 total_utilization = count + inflight_count
                 
                 if total_utilization >= max_trades:
@@ -273,11 +301,10 @@ class MT5ExecutionEngine:
                     return False
                 
                 # Per-Symbol Limit Check
-                # V17.0 UPDATE: Allow multiple trades if Pyramiding is enabled in Config
                 is_pyramid_enabled = CONFIG.get('risk_management', {}).get('pyramiding', {}).get('enabled', False)
+                max_adds = CONFIG.get('risk_management', {}).get('pyramiding', {}).get('max_adds', 1)
                 
-                # If enabled, allow up to 3 trades per symbol (Base + 2 Adds). If disabled, strict 1 per pair.
-                max_per_symbol = 3 if is_pyramid_enabled else 1
+                max_per_symbol = (1 + max_adds) if is_pyramid_enabled else 1
 
                 broker_sym = self.symbol_map.get(symbol, symbol)
                 symbol_positions = [p for p in bot_positions if p.symbol == broker_sym]
@@ -290,7 +317,7 @@ class MT5ExecutionEngine:
                 
         except Exception as e:
             log.error(f"Hard Limit Check Failed: {e}", exc_info=True)
-            return False # Fail safe: Block if we can't verify
+            return False 
 
     def execute_trade(self, request: Dict[str, Any], max_retries: int = 3) -> Optional[Dict[str, Any]]:
         log.info(f"🏗️ BUILDING ORDER: {request.get('symbol')} {request.get('type')}")
@@ -324,7 +351,6 @@ class MT5ExecutionEngine:
                 return existing
 
         # --- FORCE MARKET EXECUTION (AGGRESSOR PROTOCOL) ---
-        
         try:
             with self.lock:
                 term_info = mt5.terminal_info()
@@ -337,11 +363,10 @@ class MT5ExecutionEngine:
                     return None
             
             # --- MARKET ORDER CONSTRUCTION ---
-            if request["action"] != mt5.TRADE_ACTION_SLTP: # Don't override SL/TP modifications
+            if request["action"] != mt5.TRADE_ACTION_SLTP:
                 request["action"] = mt5.TRADE_ACTION_DEAL
                 request["type_time"] = mt5.ORDER_TIME_GTC
                 
-                # ALWAYS use current tick price for Market Execution
                 if request["type"] == mt5.ORDER_TYPE_BUY:
                     request["price"] = tick.ask
                 elif request["type"] == mt5.ORDER_TYPE_SELL:
@@ -350,23 +375,25 @@ class MT5ExecutionEngine:
                 request["price"] = PrecisionGuard.normalize_price(request["price"], broker_sym, symbol_info)
 
             # --- HARD LIMIT CHECK (SOURCE OF TRUTH) ---
-            # Perform the check ONLY for Entries (Deals or Pending Orders)
             if request["action"] in [mt5.TRADE_ACTION_DEAL, mt5.TRADE_ACTION_PENDING]:
                 if not self._check_hard_trade_limit(raw_symbol):
                     return None # BLOCK TRADING
 
-            # V17.0 FORCE 0.01 LOTS CHECK
-            # Even if strategy sent weird size, clamp it here too for double safety
+            # V20.2 FIX: DYNAMIC VOLUME PRECISION
             if "volume" in request:
                 raw_vol = float(request.get("volume", 0.01))
                 
                 vol_step = symbol_info.volume_step
                 if vol_step > 0:
+                    # Prevent scientific notation string parsing issues
+                    step_str = f"{vol_step:f}".rstrip('0').rstrip('.') if '.' in f"{vol_step:f}" else str(vol_step)
+                    decimals = len(step_str.split('.')[1]) if '.' in step_str else 0
                     steps = round(raw_vol / vol_step)
-                    request["volume"] = steps * vol_step
+                    request["volume"] = round(steps * vol_step, max(decimals, 2))
+                    
                 request["volume"] = max(symbol_info.volume_min, min(request["volume"], symbol_info.volume_max))
-                request["volume"] = round(request["volume"], 2)
 
+            # --- Normalize the Absolute Price SL/TP sent by Linux ---
             raw_sl = float(request.get("sl", 0.0))
             if raw_sl > 0:
                 request["sl"] = PrecisionGuard.normalize_price(raw_sl, broker_sym, symbol_info)
@@ -375,15 +402,11 @@ class MT5ExecutionEngine:
             if raw_tp > 0:
                 request["tp"] = PrecisionGuard.normalize_price(raw_tp, broker_sym, symbol_info)
             
-            # Since we are MARKET ONLY, filling type is usually FOK or IOC
             if request["action"] == mt5.TRADE_ACTION_PENDING:
-                 # Should not happen in Market Only mode
                 request["type_filling"] = mt5.ORDER_FILLING_RETURN
             else:
-                # Filling Mode Handling
                 filling = symbol_info.filling_mode
                 if filling == 0:
-                    # Some brokers don't set filling_mode correctly, assume IOC for market
                     request["type_filling"] = mt5.ORDER_FILLING_IOC
                 elif filling & 1: 
                     request["type_filling"] = mt5.ORDER_FILLING_FOK
@@ -415,7 +438,6 @@ class MT5ExecutionEngine:
             return None
 
         # --- EXECUTION LOOP ---
-        # REGISTER IN-FLIGHT
         if signal_uuid:
             with self.inflight_lock:
                 self.inflight_orders.add(signal_uuid)
@@ -429,8 +451,6 @@ class MT5ExecutionEngine:
                         log.info(f"✅ Trade {signal_uuid} already exists. Skipping duplicate.")
                         return existing
 
-                # UNLOCKED EXECUTION:
-                # We assume request is fully prepared. MT5 SDK is generally thread-safe for order_send
                 result = mt5.order_send(request)
                 
                 if result is None:
@@ -466,7 +486,6 @@ class MT5ExecutionEngine:
                     with self.lock:
                         new_tick = mt5.symbol_info_tick(broker_sym)
                         if new_tick:
-                            # REFRESH PRICE FOR RETRY
                             if request["action"] == mt5.TRADE_ACTION_DEAL:
                                 if request["type"] == mt5.ORDER_TYPE_BUY:
                                     request["price"] = new_tick.ask
@@ -483,25 +502,18 @@ class MT5ExecutionEngine:
                     break
             return None
         finally:
-            # CLEANUP IN-FLIGHT
             if signal_uuid:
                 with self.inflight_lock:
                     self.inflight_orders.discard(signal_uuid)
 
     def close_position(self, position_id: int, symbol: str, volume: float, pos_type: int) -> Optional[Any]:
-        """
-        Closes a specific position by ticket.
-        Enhanced with logging to debug 'CLOSE_ALL' loops.
-        """
         with self.lock:
             tick = mt5.symbol_info_tick(symbol)
             if not tick: 
                 log.error(f"❌ CLOSE FAIL: No tick for {symbol}")
                 return None
             
-            # Determine close price (Bid for Buy, Ask for Sell)
             price = tick.bid if pos_type == mt5.ORDER_TYPE_BUY else tick.ask
-            # Determine close type (Sell for Buy, Buy for Sell)
             trade_type = mt5.ORDER_TYPE_SELL if pos_type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
             
             request = {
@@ -530,6 +542,7 @@ class MT5ExecutionEngine:
                 log.info(f"✅ CLOSE SUCCESS: {symbol} Ticket:{position_id} Closed at {price}")
                 
             return result
+
 
 class HybridProducer:
     def __init__(self):
@@ -565,9 +578,8 @@ class HybridProducer:
         
         self.db_dsn = CONFIG['postgres']['dsn']
         self._connect_db_with_retry()
-        initial_bal = CONFIG.get('env', {}).get('initial_balance', 100000.0)
+        initial_bal = CONFIG.get('env', {}).get('initial_balance', 50000.0) 
         
-        # --- FIX: SAFE CONFIG LOOKUP FOR max_daily_loss_pct ---
         max_daily_loss = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.045)
         self.ftmo_monitor = FTMORiskMonitor(initial_balance=initial_bal, max_daily_loss_pct=max_daily_loss, redis_client=self.r)
         
@@ -588,7 +600,6 @@ class HybridProducer:
         self.last_tick_state = defaultdict(lambda: {'time_msc': 0, 'volume_real': 0.0})
         self.last_prices = {s: 0.0 for s in SYMBOLS}
         
-        # Initialize last_deal_scan_time to 24h ago in SERVER TIME to ensure we catch up
         self.last_deal_scan_server_ts = 0.0 
         
         self.run_precise_backfill()
@@ -667,7 +678,6 @@ class HybridProducer:
         retry_count = 0
         max_retries = 5
         
-        # Load Risk Timezone from Config (Default Europe/Prague for FTMO)
         risk_tz_str = CONFIG.get('risk_management', {}).get('risk_timezone', 'Europe/Prague')
         try:
             risk_tz = pytz.timezone(risk_tz_str)
@@ -682,46 +692,36 @@ class HybridProducer:
                         time.sleep(2)
                         retry_count += 1
                         continue
-                    info = mt5.account_info()
+                        
+                    # V20.2 Safe Fetch
+                    info = self.exec_engine._safe_account_info()
                     if not info:
                         log.warning(f"Failed to get Account Info. Retry {retry_count+1}...")
                         retry_count += 1
                         time.sleep(2)
                         continue
+                        
                     current_balance = info.balance
                     if abs(self.ftmo_monitor.initial_balance - current_balance) > (current_balance * 0.01):
                         log.warning(f"⚠️ Auto-Detecting Account Size: Config ({self.ftmo_monitor.initial_balance}) != Broker ({current_balance}). Updating Risk Limits.")
                         self.ftmo_monitor.initial_balance = current_balance
                         
-                        # --- FIX: SAFE CONFIG LOOKUP FOR max_daily_loss_pct ---
                         safe_loss_pct = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.045)
                         self.ftmo_monitor.max_daily_loss = current_balance * safe_loss_pct
                     
-                    # AUDIT FIX: Get Accurate Midnight Anchor using Broker Time
-                    # We need the current Server Time.
-                    # We query a robust symbol tick to get the latest server timestamp.
-                    server_ts = time.time() # Fallback
+                    server_ts = time.time()
                     for s in ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]:
                          tick = mt5.symbol_info_tick(s)
                          if tick:
                              server_ts = tick.time
                              break
                     
-                    # FTMO (and most brokers) resets daily stats at 00:00 CE(S)T.
-                    # We must align our "Start of Day" with the Risk Timezone.
-                    # Convert Server TS (Epoch) to Risk TZ
                     dt_utc = datetime.fromtimestamp(server_ts, timezone.utc)
                     dt_risk = dt_utc.astimezone(risk_tz)
-                    
-                    # Find Midnight in Risk TZ
                     dt_midnight_risk = dt_risk.replace(hour=0, minute=0, second=0, microsecond=0)
-                    
-                    # Convert back to UTC Epoch for MT5 query
                     dt_midnight_utc = dt_midnight_risk.astimezone(timezone.utc)
                     midnight_ts = dt_midnight_utc.timestamp()
                     
-                    # History Deals: FROM midnight TO now
-                    # Add buffer to 'now' to catch everything
                     deals = mt5.history_deals_get(float(midnight_ts), float(server_ts + 3600))
                     
                     realized_pnl_today = 0.0
@@ -731,18 +731,13 @@ class HybridProducer:
                     else:
                         log.info("No deals found for today (Start of Day).")
                     
-                    # Reconstruct Start Equity
-                    # Start = Current - PnL
-                    # Example: Current=10100, PnL=+100 -> Start=10000
                     calculated_start = current_balance - realized_pnl_today
                     self.ftmo_monitor.starting_equity_of_day = calculated_start
                     self.r.set(CONFIG['redis']['risk_keys']['daily_starting_equity'], calculated_start)
                     self.r.set("bot:account_size", self.ftmo_monitor.initial_balance) 
                     
-                    # Persist the Anchor Date to allow Engine to detect rollover
                     self.r.set("risk:last_reset_date", str(midnight_ts)) 
                     
-                    # --- FIX: SAFE CONFIG LOOKUP FOR max_daily_loss_pct ---
                     safe_loss_pct = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.045)
                     loss_limit = calculated_start * safe_loss_pct
                     hard_deck = calculated_start - loss_limit
@@ -820,8 +815,10 @@ class HybridProducer:
     def _ensure_conversion_pairs(self) -> Set[str]:
         monitored = set(ALL_MONITORED_SYMBOLS)
         with self.mt5_lock:
-            account_info = mt5.account_info()
+            # V20.2 Safe Fetch
+            account_info = self.exec_engine._safe_account_info()
             if not account_info: return monitored
+            
             acc_ccy = account_info.currency
             for sym in SYMBOLS:
                 broker_sym = self.exec_engine.symbol_map.get(sym, sym)
@@ -855,7 +852,6 @@ class HybridProducer:
         redis_failures = 0
         print("\n\n=== PRODUCER STREAMING STARTED ===\n\n")
         
-        # WATCHDOG FOR ZOMBIE TERMINAL
         last_successful_tick_time = time.time()
         
         while self.running and not self.stop_event.is_set():
@@ -872,7 +868,7 @@ class HybridProducer:
                         mt5.shutdown()
                         time.sleep(1)
                         mt5.initialize()
-                        last_successful_tick_time = time.time() # Reset watchdog
+                        last_successful_tick_time = time.time()
 
                 if time.time() - self.last_context_update > 60:
                     self._update_d1_context()
@@ -907,7 +903,6 @@ class HybridProducer:
                             bid_vol = current_vol / 2.0
                             ask_vol = current_vol / 2.0
                         
-                        # Correctly update last price AFTER estimation
                         self.last_prices[sym] = price_now
                         
                         self.cluster_engine.update_correlations(pd.DataFrame())
@@ -919,6 +914,7 @@ class HybridProducer:
                             "bid": bid, "ask": ask,
                             "price": price_now, "volume": current_vol,
                             "bid_vol": float(bid_vol), "ask_vol": float(ask_vol),
+                            "flags": int(tick.flags),
                             "ctx_d1": json.dumps(self.d1_cache.get(sym, {})),
                             "ctx_h4": json.dumps(self.h4_cache.get(sym, {}))
                         }
@@ -1039,11 +1035,6 @@ class HybridProducer:
                 time.sleep(1)
 
     def _check_mt5_revenge_status(self, symbol: str) -> bool:
-        """
-        Uses absolute Server Time for history lookups.
-        Prevents missed trades when Local Time != Server Time.
-        Acts as the 'Single Source of Truth' for Revenge Trading Cooldowns.
-        """
         try:
             cooldown_mins = CONFIG.get('risk_management', {}).get('loss_cooldown_minutes', 60)
             if cooldown_mins <= 0: return False
@@ -1052,8 +1043,6 @@ class HybridProducer:
             
             with self.mt5_lock:
                 server_now_ts = time.time() + self.exec_engine.broker_time_offset
-                
-                # Look back 24 hours to be safe
                 from_ts = server_now_ts - 86400 
                 to_ts = server_now_ts + 3600 
                 
@@ -1068,7 +1057,7 @@ class HybridProducer:
                     sorted_deals = sorted(relevant_deals, key=lambda x: x.time, reverse=True)
                     
                     for deal in sorted_deals:
-                        time.sleep(0.001) # Yield slightly
+                        time.sleep(0.001) 
                         time_since_close = server_now_ts - deal.time
                         
                         if time_since_close < (cooldown_mins * 60):
@@ -1081,9 +1070,8 @@ class HybridProducer:
                                 else:
                                     log.warning(f"🛡️ MANDATORY COOLDOWN: {symbol} BLOCKED. Win/BE {net_pnl:.2f} at {deal.time}. Expiry in {expiry_in}s")
                                 
-                                return True # Block ALL trades within window
+                                return True 
                         else:
-                            # Found a deal outside window, and since sorted, older ones are also outside
                             break
                             
         except Exception as e:
@@ -1092,10 +1080,6 @@ class HybridProducer:
         return False
 
     def _process_trade_signal_sync(self, msg_id, data):
-        """
-        Executed synchronously in the Main Thread loop.
-        Ensures thread affinity with MT5.
-        """
         try:
             symbol = data['symbol']
             action = data['action'] 
@@ -1123,7 +1107,6 @@ class HybridProducer:
                 except ValueError:
                     log.error(f"Invalid timestamp: {request_ts_str}")
             
-            # Deduplication
             if uuid_val:
                 if self.r.sismember("processed_signals", uuid_val):
                     log.warning(f"🔁 Duplicate Signal Ignored: {uuid_val}")
@@ -1132,12 +1115,11 @@ class HybridProducer:
                 self.r.sadd("processed_signals", uuid_val)
                 self.r.expire("processed_signals", 3600)
             
-            # --- EXECUTION ROUTING ---
             is_entry_signal = (action in ["BUY", "SELL"]) or (str(action) in ["1", "5"])
             
             if is_entry_signal:
                 with self.mt5_lock:
-                    info = mt5.account_info()
+                    info = self.exec_engine._safe_account_info()
                     if info:
                         self.ftmo_monitor.equity = info.equity
                         if not self.ftmo_monitor.can_trade():
@@ -1145,7 +1127,6 @@ class HybridProducer:
                             self.r.xack(TRADE_REQUEST_STREAM, "execution_group", msg_id)
                             return
 
-                # --- REVENGE GUARD CHECK ---
                 if self._check_mt5_revenge_status(symbol):
                     log.warning(f"⛔ Signal Dropped: {symbol} is in cooldown (MT5 History Check).")
                     self.r.xack(TRADE_REQUEST_STREAM, "execution_group", msg_id)
@@ -1168,7 +1149,6 @@ class HybridProducer:
 
                 log.info(f"⚡ EXECUTING {log_type} {symbol} | Vol: {data['volume']} | Price: {price} | ActionCode: {order_action}")
                 
-                # If order type is MARKET/DEAL, force price to 0.0 to trigger Instant Execution
                 exec_price = price
                 if order_action == mt5.TRADE_ACTION_DEAL:
                     exec_price = 0.0
@@ -1187,10 +1167,9 @@ class HybridProducer:
                 })
             
             elif action == "MODIFY":
-                # FIXED: Added 'symbol' and 'magic' to the request dictionary
                 self.exec_engine.execute_trade({
                     "action": mt5.TRADE_ACTION_SLTP, 
-                    "symbol": symbol,  # <--- CRITICAL FIX
+                    "symbol": symbol,  
                     "position": int(data['ticket']),
                     "sl": float(data.get("sl", 0)), 
                     "tp": float(data.get("tp", 0)),
@@ -1208,9 +1187,9 @@ class HybridProducer:
         with self.mt5_lock:
             if symbol:
                 broker_sym = self.exec_engine.symbol_map.get(symbol, symbol)
-                positions = mt5.positions_get(symbol=broker_sym)
+                positions = self.exec_engine._safe_positions_get(symbol=broker_sym)
             else:
-                positions = mt5.positions_get()
+                positions = self.exec_engine._safe_positions_get()
             
             if not positions: 
                 log.info(f"ℹ️ No positions found to close for {symbol if symbol else 'ALL'}.")
@@ -1241,17 +1220,20 @@ class HybridProducer:
                     for deal in deals:
                         if deal.magic == MAGIC_NUMBER and deal.entry in [mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT]:
                             net_pnl = deal.profit + deal.swap + deal.commission
+                            
+                            utc_close_time = deal.time - self.exec_engine.broker_time_offset
+
                             payload = {
                                 "symbol": deal.symbol, "ticket": deal.ticket,
                                 "position_id": deal.position_id, "net_pnl": float(net_pnl),
                                 "close_price": deal.price, "reason": deal.reason,
-                                "timestamp": deal.time # Server Time
+                                "timestamp": float(utc_close_time) 
                             }
                             pipe.xadd(CLOSED_TRADE_STREAM, payload, maxlen=1000, approximate=True)
                             published_count += 1
                     if published_count > 0:
                         pipe.execute()
-                        log.info(f"📊 Published {published_count} Closed Trades to {CLOSED_TRADE_STREAM}")
+                        log.info(f"📊 Published {published_count} Closed Trades to {CLOSED_TRADE_STREAM} (UTC sync applied)")
             except Exception as e: log.error(f"Closed Trade Monitor Error: {e}")
             time.sleep(5)
 
@@ -1259,8 +1241,9 @@ class HybridProducer:
         while self.running:
             try:
                 with self.mt5_lock:
-                    positions = mt5.positions_get()
-                    info = mt5.account_info()
+                    positions = self.exec_engine._safe_positions_get()
+                    info = self.exec_engine._safe_account_info()
+                    
                     if info:
                         self.r.hset(CONFIG['redis']['account_info_key'], mapping={
                             "balance": info.balance, "equity": info.equity,
@@ -1270,13 +1253,13 @@ class HybridProducer:
                         })
                         self.r.set(CONFIG['redis']['risk_keys']['current_equity'], info.equity)
                     if self.ftmo_monitor:
-                        self.ftmo_monitor.equity = info.equity
+                        self.ftmo_monitor.equity = info.equity if info else self.ftmo_monitor.equity
                         if not self.ftmo_monitor.can_trade():
                             log.critical("RISK BREACH DETECTED IN SYNC LOOP. ATTEMPTING LIQUIDATION.")
                             self._close_all_positions()
                     try:
                         hard_deck = float(self.r.get("risk:hard_deck_level") or 0.0)
-                        if hard_deck > 0 and info.equity < hard_deck:
+                        if info and hard_deck > 0 and info.equity < hard_deck:
                             log.critical(f"💀 HARD DECK BREACHED: Equity {info.equity} < {hard_deck}. LIQUIDATING ALL.")
                             self._close_all_positions()
                     except Exception as e: log.error(f"Hard Deck Check Failed: {e}")
@@ -1285,12 +1268,14 @@ class HybridProducer:
                     if positions:
                         for p in positions:
                             if p.magic == MAGIC_NUMBER:
+                                utc_entry_time = p.time - self.exec_engine.broker_time_offset
+                                
                                 pos_list.append({
                                     "ticket": p.ticket, "symbol": p.symbol,
                                     "type": "BUY" if p.type == mt5.ORDER_TYPE_BUY else "SELL",
                                     "volume": p.volume, "entry_price": p.price_open,
                                     "profit": p.profit, "sl": p.sl, "tp": p.tp,
-                                    "time": p.time, "magic": p.magic, "comment": p.comment 
+                                    "time": float(utc_entry_time), "magic": p.magic, "comment": p.comment 
                                 })
                     key = f"{CONFIG['redis']['position_state_key_prefix']}:{MAGIC_NUMBER}"
                     self.r.set(key, json.dumps(pos_list))
@@ -1300,7 +1285,7 @@ class HybridProducer:
     def _validate_risk_synchronous(self, symbol: str) -> bool:
         try:
             with self.mt5_lock:
-                account_info = mt5.account_info()
+                account_info = self.exec_engine._safe_account_info()
                 if not account_info: return False
                 self.ftmo_monitor.equity = account_info.equity
                 if not self.ftmo_monitor.can_trade():
@@ -1319,7 +1304,6 @@ class HybridProducer:
         
         last_anchor_id = None
         
-        # Load Risk Timezone
         risk_tz_str = CONFIG.get('risk_management', {}).get('risk_timezone', 'Europe/Prague')
         try:
             risk_tz = pytz.timezone(risk_tz_str)
@@ -1327,24 +1311,20 @@ class HybridProducer:
             risk_tz = pytz.timezone('Europe/Prague')
         
         while self.running and not self.stop_event.is_set():
-            # Get Current Server Time (UTC Epoch)
             server_ts = time.time()
             try:
                 server_ts += self.exec_engine.broker_time_offset
             except: pass
             
-            # Convert to Risk TZ
             dt_utc = datetime.fromtimestamp(server_ts, timezone.utc)
             dt_risk = dt_utc.astimezone(risk_tz)
             
             hour = dt_risk.hour
             minute = dt_risk.minute
             
-            # Freeze window: 23:55 to 00:05 in Risk TZ
             if (hour == 23 and minute >= 55) or (hour == 0 and minute <= 5):
                 self.r.set(freeze_key, "1")
                 
-                # V17.5 FIX: String date as ID, respects Risk TZ
                 current_midnight_id = dt_risk.strftime("%Y-%m-%d") 
                 
                 if hour == 0 and minute == 0 and current_midnight_id != last_anchor_id:
@@ -1352,12 +1332,11 @@ class HybridProducer:
                     max_retries = 5
                     for attempt in range(max_retries):
                         with self.mt5_lock:
-                            info = mt5.account_info()
+                            info = self.exec_engine._safe_account_info()
                             if info:
                                 start_equity = info.equity
                                 self.r.set(daily_start_key, start_equity)
                                 
-                                # --- FIX: SAFE CONFIG LOOKUP FOR max_daily_loss_pct ---
                                 max_loss_pct = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.045)
                                 loss_limit = start_equity * max_loss_pct
                                 hard_deck = start_equity - loss_limit
@@ -1418,7 +1397,7 @@ class HybridProducer:
                     recent = list(self.notified_tickets)[-1000:]
                     self.notified_tickets = set(recent)
                 with self.mt5_lock:
-                    orders = mt5.orders_get()
+                    orders = self.exec_engine._safe_orders_get()
                     if orders:
                         for order in orders:
                             if order.magic == MAGIC_NUMBER:
@@ -1447,13 +1426,12 @@ class HybridProducer:
             threading.Thread(target=self._maintain_time_sync, daemon=True) 
         ]
         for t in threads: t.start()
-        log.info(f"{LogSymbols.ONLINE} Windows Producer Running. Risk State: {self.ftmo_monitor.starting_equity_of_day}")
+        log.info(f"{LogSymbols.ONLINE} Windows Producer Running. Risk State: {self.ftmo_monitor.starting_equity_of_day} | V20.2 Profitability Patch Bridge Active")
         try:
             while self.running:
                 try:
                     msg_id, data = self.execution_queue.get(timeout=1)
                     if "action" in data:
-                        # Only run risk check for trade entries (BUY/SELL or 1/5)
                         act = data["action"]
                         is_entry = (act in ["BUY", "SELL"]) or (str(act) in ["1", "5"])
                         
