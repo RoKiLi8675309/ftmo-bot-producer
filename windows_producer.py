@@ -72,14 +72,14 @@ KILL_SWITCH_FILE = "kill_switch.lock"
 MAX_TRADE_LATENCY_SECONDS = 5.0
 
 # Dynamic Timeframe Mapping
-TARGET_TF_STR = CONFIG['trading'].get('timeframe', 'M5').upper()
+TARGET_TF_STR = CONFIG['trading'].get('timeframe', 'M15').upper()
 try:
     TIMEFRAME_MT5 = getattr(mt5, f"TIMEFRAME_{TARGET_TF_STR}")
     log.info(f"TIMEFRAME CONFIG: Set to {TARGET_TF_STR} (MT5 Constant: {TIMEFRAME_MT5})")
 except AttributeError:
-    log.warning(f"Invalid timeframe '{TARGET_TF_STR}' in config. Defaulting to M5.")
-    TIMEFRAME_MT5 = mt5.TIMEFRAME_M5
-    TARGET_TF_STR = "M5"
+    log.warning(f"Invalid timeframe '{TARGET_TF_STR}' in config. Defaulting to M15.")
+    TIMEFRAME_MT5 = mt5.TIMEFRAME_M15
+    TARGET_TF_STR = "M15"
 
 # --- ADAPTIVE TTL MANAGER ---
 class AdaptiveTTLManager:
@@ -140,7 +140,7 @@ class MT5ExecutionEngine:
         """Checks connection with a timeout guard."""
         return mt5.terminal_info().connected
 
-    # --- V20.2 IPC ROBUSTNESS WRAPPERS ---
+    # --- V20.5 IPC ROBUSTNESS WRAPPERS ---
     def _safe_positions_get(self, symbol: Optional[str] = None, max_retries: int = 3) -> Optional[tuple]:
         """Safely fetches positions with retry logic against MT5 IPC drops."""
         for attempt in range(max_retries):
@@ -254,7 +254,7 @@ class MT5ExecutionEngine:
         search_token = unique_id[:8]
         
         with self.lock:
-            # 1. Check Positions (Live Trades) - V20.2 Safe Fetch
+            # 1. Check Positions (Live Trades) - V20.5 Safe Fetch
             positions = self._safe_positions_get(symbol=broker_sym)
             if positions:
                 for pos in positions:
@@ -262,7 +262,7 @@ class MT5ExecutionEngine:
                         log.warning(f"🛑 IDEMPOTENCY GUARD: Signal {unique_id} already executing as Position {pos.ticket}.")
                         return {"retcode": mt5.TRADE_RETCODE_DONE, "order": pos.ticket, "price": pos.price_open}
             
-            # 2. Check Orders (Pending Limits/Stops) - V20.2 Safe Fetch
+            # 2. Check Orders (Pending Limits/Stops) - V20.5 Safe Fetch
             orders = self._safe_orders_get(symbol=broker_sym)
             if orders:
                 for order in orders:
@@ -273,7 +273,8 @@ class MT5ExecutionEngine:
         return None
 
     def _check_hard_trade_limit(self, symbol: str) -> bool:
-        max_trades = CONFIG.get('risk_management', {}).get('max_open_trades', 4)
+        # V20.5 FIX: High global limit to allow horizontal scale across all pairs
+        max_trades = CONFIG.get('risk_management', {}).get('max_open_trades', 100)
         
         try:
             # 1. Check In-Flight Cache
@@ -284,7 +285,7 @@ class MT5ExecutionEngine:
                     return False
 
             with self.lock:
-                # 2. Get ALL positions for this bot - V20.2 Safe Fetch
+                # 2. Get ALL positions for this bot - V20.5 Safe Fetch
                 positions = self._safe_positions_get()
                 
                 if positions is None:
@@ -300,18 +301,15 @@ class MT5ExecutionEngine:
                     log.critical(f"🛑 HARD LIMIT GATE: Live ({count}) + In-Flight ({inflight_count}) >= Limit ({max_trades}). Trade Blocked.")
                     return False
                 
-                # Per-Symbol Limit Check
-                is_pyramid_enabled = CONFIG.get('risk_management', {}).get('pyramiding', {}).get('enabled', False)
-                max_adds = CONFIG.get('risk_management', {}).get('pyramiding', {}).get('max_adds', 1)
-                
-                max_per_symbol = (1 + max_adds) if is_pyramid_enabled else 1
+                # V20.5 FIX: STRICT 1 TRADE PER PAIR GUARANTEE
+                max_per_symbol = 1
 
                 broker_sym = self.symbol_map.get(symbol, symbol)
                 symbol_positions = [p for p in bot_positions if p.symbol == broker_sym]
                 
                 if len(symbol_positions) >= max_per_symbol:
-                     log.warning(f"🛑 PAIR LIMIT: {symbol} already has {len(symbol_positions)} trade(s) (Max {max_per_symbol}). Blocked.")
-                     return False
+                    log.warning(f"🛑 PAIR LIMIT: {symbol} already has {len(symbol_positions)} trade(s) (Max {max_per_symbol}). Blocked.")
+                    return False
                 
                 return True
                 
@@ -379,7 +377,27 @@ class MT5ExecutionEngine:
                 if not self._check_hard_trade_limit(raw_symbol):
                     return None # BLOCK TRADING
 
-            # V20.2 FIX: DYNAMIC VOLUME PRECISION
+            # --- V20.5: STRICT R:R ENFORCEMENT AT THE METAL LAYER ---
+            if request["action"] in [mt5.TRADE_ACTION_DEAL, mt5.TRADE_ACTION_PENDING]:
+                entry_p = request["price"]
+                sl_p = float(request.get("sl", 0.0))
+                tp_p = float(request.get("tp", 0.0))
+                
+                if sl_p > 0 and tp_p > 0:
+                    risk_dist = abs(entry_p - sl_p)
+                    reward_dist = abs(tp_p - entry_p)
+                    
+                    if risk_dist > 0:
+                        rr_ratio = reward_dist / risk_dist
+                        # Ensure mathematically we never bleed out to spread trap.
+                        # 1.90 allows for minor float rounding from the 2.0x target.
+                        if rr_ratio < 1.90:
+                            log.error(f"🛑 REJECTED BY METAL: {broker_sym} R:R Ratio is {rr_ratio:.2f} (Target >= 2.0). Trade Blocked to prevent spread bleed.")
+                            try: self.r.publish("order_failed_channel", json.dumps({"symbol": raw_symbol, "reason": f"Poor R:R ({rr_ratio:.2f})"}))
+                            except: pass
+                            return None
+
+            # V20.5 FIX: DYNAMIC VOLUME PRECISION
             if "volume" in request:
                 raw_vol = float(request.get("volume", 0.01))
                 
@@ -474,9 +492,28 @@ class MT5ExecutionEngine:
 
                 if result.retcode == mt5.TRADE_RETCODE_DONE:
                     log.info(f"✅ EXECUTION SUCCESS: {broker_sym} Ticket: {result.order}")
+                    # V20.5 FIX: Broadcast to Linux terminal
+                    try:
+                        self.r.publish("order_filled_channel", json.dumps({
+                            "symbol": raw_symbol, 
+                            "ticket": result.order, 
+                            "type": "MARKET_FILLED",
+                            "price": result.price
+                        }))
+                    except Exception: pass
                     return result._asdict()
+                    
                 elif result.retcode == mt5.TRADE_RETCODE_PLACED:
                     log.info(f"✅ LIMIT ORDER PLACED: {broker_sym} Ticket: {result.order} @ {request['price']}")
+                    # V20.5 FIX: Broadcast to Linux terminal
+                    try:
+                        self.r.publish("order_filled_channel", json.dumps({
+                            "symbol": raw_symbol, 
+                            "ticket": result.order, 
+                            "type": "LIMIT_PLACED",
+                            "price": request['price']
+                        }))
+                    except Exception: pass
                     return result._asdict()
                 
                 elif result.retcode in [mt5.TRADE_RETCODE_REQUOTE, mt5.TRADE_RETCODE_CONNECTION, mt5.TRADE_RETCODE_PRICE_OFF, mt5.TRADE_RETCODE_INVALID_PRICE, 10016]:
@@ -540,6 +577,15 @@ class MT5ExecutionEngine:
                 log.error(f"❌ CLOSE FAILED: {symbol} Ticket:{position_id} Ret:{result.retcode} ({result.comment})")
             else:
                 log.info(f"✅ CLOSE SUCCESS: {symbol} Ticket:{position_id} Closed at {price}")
+                # V20.5 FIX: Notify Linux Terminal
+                try:
+                    self.r.publish("order_filled_channel", json.dumps({
+                        "symbol": symbol, 
+                        "ticket": position_id, 
+                        "type": "POSITION_CLOSED",
+                        "price": price
+                    }))
+                except Exception: pass
                 
             return result
 
@@ -693,7 +739,7 @@ class HybridProducer:
                         retry_count += 1
                         continue
                         
-                    # V20.2 Safe Fetch
+                    # V20.5 Safe Fetch
                     info = self.exec_engine._safe_account_info()
                     if not info:
                         log.warning(f"Failed to get Account Info. Retry {retry_count+1}...")
@@ -815,7 +861,7 @@ class HybridProducer:
     def _ensure_conversion_pairs(self) -> Set[str]:
         monitored = set(ALL_MONITORED_SYMBOLS)
         with self.mt5_lock:
-            # V20.2 Safe Fetch
+            # V20.5 Safe Fetch
             account_info = self.exec_engine._safe_account_info()
             if not account_info: return monitored
             
@@ -1426,7 +1472,7 @@ class HybridProducer:
             threading.Thread(target=self._maintain_time_sync, daemon=True) 
         ]
         for t in threads: t.start()
-        log.info(f"{LogSymbols.ONLINE} Windows Producer Running. Risk State: {self.ftmo_monitor.starting_equity_of_day} | V20.2 Profitability Patch Bridge Active")
+        log.info(f"{LogSymbols.ONLINE} Windows Producer Running. Risk State: {self.ftmo_monitor.starting_equity_of_day} | V20.5 Expert Protocol Bridge Active")
         try:
             while self.running:
                 try:
