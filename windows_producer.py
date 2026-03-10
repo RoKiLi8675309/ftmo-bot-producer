@@ -131,7 +131,7 @@ class MT5ExecutionEngine:
         # 1. Build Suffix Map first
         self._build_symbol_mapping()
 
-        # 2. Sync Time
+        # 2. Sync Time (Now with V20.10 Fresh Tick Polling to prevent offset drift)
         if not self._calculate_broker_offset_robust():
             log.critical("CRITICAL: Timezone Sync Failed. Aborting startup.")
             raise RuntimeError("Timezone Sync Failed")
@@ -214,7 +214,12 @@ class MT5ExecutionEngine:
                     self.symbol_map[raw_sym] = raw_sym 
 
     def _calculate_broker_offset_robust(self, max_retries: int = 10) -> bool:
-        log.info("Calculating Broker-Local Time Offset...")
+        """
+        V20.10 FIX: True Server Time Sync.
+        We MUST wait for a tick to update in real-time to avoid capturing market 
+        silence (stale ticks) as a false time offset, which causes Latency Guard drops.
+        """
+        log.info(f"{LogSymbols.TIME} Calculating Broker-Local Time Offset (Awaiting fresh market tick)...")
         candidates = [self.symbol_map.get(s, s) for s in SYMBOLS]
         if not candidates:
             candidates = ["EURUSD", "GBPUSD", "USDJPY", "BTCUSD"]
@@ -225,17 +230,39 @@ class MT5ExecutionEngine:
                 for sym in unique_candidates:
                     if not mt5.symbol_select(sym, True):
                         continue
-                    tick = mt5.symbol_info_tick(sym)
-                    if tick:
-                        server_ts = tick.time
-                        local_ts = datetime.now(timezone.utc).timestamp()
-                        self.broker_time_offset = server_ts - local_ts
-                        try: self.r.set("producer:broker_time_offset", self.broker_time_offset)
-                        except: pass
-                        log.info(f"TIMEZONE AUDIT: Broker Offset: {self.broker_time_offset:.2f}s (via {sym})")
-                        return True
-            log.warning(f"Timezone Sync Attempt {attempt+1}/{max_retries} failed. Retrying...")
+                    
+                    # Capture the stale state
+                    initial_tick = mt5.symbol_info_tick(sym)
+                    if not initial_tick: continue
+                    initial_time = initial_tick.time_msc
+                    
+                    # Poll aggressively until the precise moment a new tick arrives
+                    for _ in range(50):  # Max 5 second wait per symbol
+                        time.sleep(0.1)
+                        fresh_tick = mt5.symbol_info_tick(sym)
+                        if fresh_tick and fresh_tick.time_msc != initial_time:
+                            server_ts = fresh_tick.time_msc / 1000.0
+                            local_ts = datetime.now(timezone.utc).timestamp()
+                            self.broker_time_offset = server_ts - local_ts
+                            try: 
+                                self.r.set("producer:broker_time_offset", self.broker_time_offset)
+                            except: pass
+                            log.info(f"{LogSymbols.SUCCESS} TIMEZONE AUDIT: True Broker Offset: {self.broker_time_offset:.2f}s (via {sym} fresh tick)")
+                            return True
+
+            log.warning(f"Timezone Sync Attempt {attempt+1}/{max_retries} failed (Market might be completely frozen). Retrying...")
             time.sleep(2)
+            
+        # Absolute fallback if weekend/market closed completely
+        log.warning("⚠️ Market appears closed. Using stale tick for offset approximation.")
+        with self.lock:
+            for sym in unique_candidates:
+                tick = mt5.symbol_info_tick(sym)
+                if tick:
+                    server_ts = tick.time
+                    local_ts = datetime.now(timezone.utc).timestamp()
+                    self.broker_time_offset = server_ts - local_ts
+                    return True
         return False
 
     def _get_symbol_info(self, symbol: str):
@@ -254,7 +281,7 @@ class MT5ExecutionEngine:
         search_token = unique_id[:8]
         
         with self.lock:
-            # 1. Check Positions (Live Trades) - V20.6 Safe Fetch
+            # 1. Check Positions (Live Trades)
             positions = self._safe_positions_get(symbol=broker_sym)
             if positions:
                 for pos in positions:
@@ -262,7 +289,7 @@ class MT5ExecutionEngine:
                         log.warning(f"🛑 IDEMPOTENCY GUARD: Signal {unique_id} already executing as Position {pos.ticket}.")
                         return {"retcode": mt5.TRADE_RETCODE_DONE, "order": pos.ticket, "price": pos.price_open}
             
-            # 2. Check Orders (Pending Limits/Stops) - V20.6 Safe Fetch
+            # 2. Check Orders (Pending Limits/Stops)
             orders = self._safe_orders_get(symbol=broker_sym)
             if orders:
                 for order in orders:
@@ -273,7 +300,6 @@ class MT5ExecutionEngine:
         return None
 
     def _check_hard_trade_limit(self, symbol: str) -> bool:
-        # V20.6 FIX: High global limit to allow horizontal scale across all pairs
         max_trades = CONFIG.get('risk_management', {}).get('max_open_trades', 100)
         
         try:
@@ -285,7 +311,7 @@ class MT5ExecutionEngine:
                     return False
 
             with self.lock:
-                # 2. Get ALL positions for this bot - V20.6 Safe Fetch
+                # 2. Get ALL positions for this bot
                 positions = self._safe_positions_get()
                 
                 if positions is None:
@@ -301,8 +327,11 @@ class MT5ExecutionEngine:
                     log.critical(f"🛑 HARD LIMIT GATE: Live ({count}) + In-Flight ({inflight_count}) >= Limit ({max_trades}). Trade Blocked.")
                     return False
                 
-                # V20.6 FIX: STRICT 1 TRADE PER PAIR GUARANTEE
+                # V20.9 FIX: Dynamic Pyramiding Integration
+                pyramid_conf = CONFIG.get('risk_management', {}).get('pyramiding', {})
                 max_per_symbol = 1
+                if pyramid_conf.get('enabled', False):
+                    max_per_symbol += int(pyramid_conf.get('max_adds', 1))
 
                 broker_sym = self.symbol_map.get(symbol, symbol)
                 symbol_positions = [p for p in bot_positions if p.symbol == broker_sym]
@@ -377,7 +406,7 @@ class MT5ExecutionEngine:
                 if not self._check_hard_trade_limit(raw_symbol):
                     return None # BLOCK TRADING
 
-            # --- V20.6: STRICT R:R ENFORCEMENT AT THE METAL LAYER ---
+            # --- STRICT R:R ENFORCEMENT AT THE METAL LAYER ---
             if request["action"] in [mt5.TRADE_ACTION_DEAL, mt5.TRADE_ACTION_PENDING]:
                 entry_p = request.get("price", 0.0)
                 sl_p = float(request.get("sl", 0.0))
@@ -389,8 +418,6 @@ class MT5ExecutionEngine:
                     
                     if risk_dist > 0:
                         rr_ratio = reward_dist / risk_dist
-                        # Ensure mathematically we never bleed out to spread trap.
-                        # 1.90 allows for minor float rounding from the 2.0x target.
                         if rr_ratio < 1.90:
                             log.error(f"🛑 REJECTED BY METAL: {broker_sym} R:R Ratio is {rr_ratio:.2f} (Target >= 2.0). Trade Blocked to prevent spread bleed.")
                             try: self.r.publish("order_failed_channel", json.dumps({"symbol": raw_symbol, "reason": f"Poor R:R ({rr_ratio:.2f})"}))
@@ -399,13 +426,12 @@ class MT5ExecutionEngine:
                         else:
                             log.info(f"🛡️ METAL LAYER R:R CHECK PASSED: {broker_sym} R:R={rr_ratio:.2f}")
 
-            # V20.6 FIX: DYNAMIC VOLUME PRECISION
+            # DYNAMIC VOLUME PRECISION
             if "volume" in request:
                 raw_vol = float(request.get("volume", 0.01))
                 
                 vol_step = symbol_info.volume_step
                 if vol_step > 0:
-                    # Prevent scientific notation string parsing issues
                     step_str = f"{vol_step:f}".rstrip('0').rstrip('.') if '.' in f"{vol_step:f}" else str(vol_step)
                     decimals = len(step_str.split('.')[1]) if '.' in step_str else 0
                     steps = round(raw_vol / vol_step)
@@ -448,13 +474,9 @@ class MT5ExecutionEngine:
             if 'type_time' in request: request['type_time'] = int(request['type_time'])
             if 'type_filling' in request: request['type_filling'] = int(request['type_filling'])
 
-            safe_comment = raw_comment.replace("|", " ").replace(":", " ").replace("%", "").replace("_", "")
-            if signal_uuid:
-                short_uuid = signal_uuid[:8]
-                final_comment = f"{short_uuid} {safe_comment}"
-            else:
-                final_comment = safe_comment
-            request["comment"] = final_comment[:23].strip()
+            # V20.11 FIX: Hard truncate to 26 characters to safely clear MT5's 31-byte internal limit
+            safe_comment = raw_comment.replace("|", " ").replace(":", " ").replace("%", "")
+            request["comment"] = safe_comment[:26].strip()
 
         except (ValueError, TypeError) as e:
             log.error(f"Sanitization/Casting error for {broker_sym}: {e}")
@@ -465,8 +487,17 @@ class MT5ExecutionEngine:
             with self.inflight_lock:
                 self.inflight_orders.add(signal_uuid)
 
+        # V20.11 FIX: Filter dictionary to STRICTLY MT5 valid fields. 
+        # MT5 C-extension will throw Error -2 (Invalid Argument) if it sees "uuid" or other injected tracking keys.
+        mt5_valid_keys = [
+            "action", "magic", "order", "symbol", "volume", "price", "stoplimit",
+            "sl", "tp", "deviation", "type", "type_filling", "type_time", "expiration",
+            "comment", "position", "position_by"
+        ]
+        mt5_request = {k: v for k, v in request.items() if k in mt5_valid_keys}
+
         try:
-            log.info(f"🚀 SENDING ORDER TO MT5: {json.dumps(request, default=str)}")
+            log.info(f"🚀 SENDING ORDER TO MT5: {json.dumps(mt5_request, default=str)}")
             for attempt in range(max_retries):
                 if attempt > 0 and signal_uuid:
                     existing = self._check_idempotency(raw_symbol, signal_uuid)
@@ -474,7 +505,7 @@ class MT5ExecutionEngine:
                         log.info(f"✅ Trade {signal_uuid} already exists. Skipping duplicate.")
                         return existing
 
-                result = mt5.order_send(request)
+                result = mt5.order_send(mt5_request)
                 
                 if result is None:
                     err = mt5.last_error()
@@ -497,7 +528,7 @@ class MT5ExecutionEngine:
 
                 if result.retcode == mt5.TRADE_RETCODE_DONE:
                     log.info(f"✅ EXECUTION SUCCESS: {broker_sym} Ticket: {result.order}")
-                    # V20.6 FIX: Broadcast to Linux terminal
+                    # Broadcast to Linux terminal
                     try:
                         self.r.publish("order_filled_channel", json.dumps({
                             "symbol": raw_symbol, 
@@ -510,7 +541,7 @@ class MT5ExecutionEngine:
                     
                 elif result.retcode == mt5.TRADE_RETCODE_PLACED:
                     log.info(f"✅ LIMIT ORDER PLACED: {broker_sym} Ticket: {result.order} @ {request['price']}")
-                    # V20.6 FIX: Broadcast to Linux terminal
+                    # Broadcast to Linux terminal
                     try:
                         self.r.publish("order_filled_channel", json.dumps({
                             "symbol": raw_symbol, 
@@ -539,7 +570,7 @@ class MT5ExecutionEngine:
                                 
                                 request["price"] = PrecisionGuard.normalize_price(request["price"], broker_sym, symbol_info)
                                 
-                                # CRITICAL FIX: Shift SL/TP dynamically to preserve geometry during requotes
+                                # Shift SL/TP dynamically to preserve geometry during requotes
                                 if old_price > 0:
                                     offset = request["price"] - old_price
                                     if request.get("sl", 0.0) > 0: 
@@ -593,7 +624,6 @@ class MT5ExecutionEngine:
                 log.error(f"❌ CLOSE FAILED: {symbol} Ticket:{position_id} Ret:{result.retcode} ({result.comment})")
             else:
                 log.info(f"✅ CLOSE SUCCESS: {symbol} Ticket:{position_id} Closed at {price}")
-                # V20.6 FIX: Notify Linux Terminal
                 try:
                     self.r.publish("order_filled_channel", json.dumps({
                         "symbol": symbol, 
@@ -642,7 +672,7 @@ class HybridProducer:
         self._connect_db_with_retry()
         initial_bal = CONFIG.get('env', {}).get('initial_balance', 50000.0) 
         
-        max_daily_loss = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.045)
+        max_daily_loss = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.040)
         self.ftmo_monitor = FTMORiskMonitor(initial_balance=initial_bal, max_daily_loss_pct=max_daily_loss, redis_client=self.r)
         
         self._optimize_process()
@@ -755,7 +785,6 @@ class HybridProducer:
                         retry_count += 1
                         continue
                         
-                    # V20.6 Safe Fetch
                     info = self.exec_engine._safe_account_info()
                     if not info:
                         log.warning(f"Failed to get Account Info. Retry {retry_count+1}...")
@@ -768,7 +797,7 @@ class HybridProducer:
                         log.warning(f"⚠️ Auto-Detecting Account Size: Config ({self.ftmo_monitor.initial_balance}) != Broker ({current_balance}). Updating Risk Limits.")
                         self.ftmo_monitor.initial_balance = current_balance
                         
-                        safe_loss_pct = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.045)
+                        safe_loss_pct = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.040)
                         self.ftmo_monitor.max_daily_loss = current_balance * safe_loss_pct
                     
                     server_ts = time.time()
@@ -800,7 +829,7 @@ class HybridProducer:
                     
                     self.r.set("risk:last_reset_date", str(midnight_ts)) 
                     
-                    safe_loss_pct = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.045)
+                    safe_loss_pct = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.040)
                     loss_limit = calculated_start * safe_loss_pct
                     hard_deck = calculated_start - loss_limit
                     self.r.set("risk:hard_deck_level", hard_deck)
@@ -877,7 +906,6 @@ class HybridProducer:
     def _ensure_conversion_pairs(self) -> Set[str]:
         monitored = set(ALL_MONITORED_SYMBOLS)
         with self.mt5_lock:
-            # V20.6 Safe Fetch
             account_info = self.exec_engine._safe_account_info()
             if not account_info: return monitored
             
@@ -947,7 +975,6 @@ class HybridProducer:
                         last_state = self.last_tick_state[sym]
                         
                         raw_vol = float(tick.volume_real if tick.volume_real > 0 else tick.volume)
-                        # V20.6 FIX: Prevent Zero-Volume bias by using 0.001 fallback instead of 1.0
                         current_vol = raw_vol if raw_vol > 0 else 0.001
                         
                         if tick.time_msc == last_state['time_msc'] and current_vol == last_state['volume_real']:
@@ -971,10 +998,14 @@ class HybridProducer:
                         
                         self.cluster_engine.update_correlations(pd.DataFrame())
                         
+                        # Preserve existing utc_ts calculation for historic bar alignment
                         utc_ts = int(tick.time_msc) - int(self.exec_engine.broker_time_offset * 1000)
                         
+                        # V20.10 FIX: Provide a "publish_time" so the Linux Latency Guard can
+                        # measure pipeline delay independently of market silence.
                         payload = {
                             "symbol": sym, "time": utc_ts,
+                            "publish_time": time.time() * 1000.0, 
                             "bid": bid, "ask": ask,
                             "price": price_now, "volume": current_vol,
                             "bid_vol": float(bid_vol), "ask_vol": float(ask_vol),
@@ -1404,7 +1435,7 @@ class HybridProducer:
                                 start_equity = info.equity
                                 self.r.set(daily_start_key, start_equity)
                                 
-                                max_loss_pct = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.045)
+                                max_loss_pct = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.040)
                                 loss_limit = start_equity * max_loss_pct
                                 hard_deck = start_equity - loss_limit
                                 self.r.set(hard_deck_key, hard_deck)
@@ -1493,7 +1524,7 @@ class HybridProducer:
             threading.Thread(target=self._maintain_time_sync, daemon=True) 
         ]
         for t in threads: t.start()
-        log.info(f"{LogSymbols.ONLINE} Windows Producer Running. Risk State: {self.ftmo_monitor.starting_equity_of_day} | V20.6 Expert Protocol Bridge Active")
+        log.info(f"{LogSymbols.ONLINE} Windows Producer Running. Risk State: {self.ftmo_monitor.starting_equity_of_day} | V20.10 Expert Protocol Bridge Active")
         try:
             while self.running:
                 try:
