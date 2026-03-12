@@ -131,7 +131,7 @@ class MT5ExecutionEngine:
         # 1. Build Suffix Map first
         self._build_symbol_mapping()
 
-        # 2. Sync Time (Now with V20.10 Fresh Tick Polling to prevent offset drift)
+        # 2. Sync Time
         if not self._calculate_broker_offset_robust():
             log.critical("CRITICAL: Timezone Sync Failed. Aborting startup.")
             raise RuntimeError("Timezone Sync Failed")
@@ -401,10 +401,37 @@ class MT5ExecutionEngine:
                 
                 request["price"] = PrecisionGuard.normalize_price(request["price"], broker_sym, symbol_info)
 
+            # --- V20.13 FIX: GEOMETRIC PARITY SHIFT (SPREAD SLIPPAGE CURE) ---
+            # Moves SL and TP dynamically relative to the execution price to preserve R:R
+            if request["action"] == mt5.TRADE_ACTION_DEAL:
+                intended_price = float(request.get("intended_price", 0.0))
+                if intended_price > 0:
+                    offset = request["price"] - intended_price
+                    raw_sl = float(request.get("sl", 0.0))
+                    raw_tp = float(request.get("tp", 0.0))
+                    
+                    if raw_sl > 0:
+                        request["sl"] = raw_sl + offset
+                    if raw_tp > 0:
+                        request["tp"] = raw_tp + offset
+                    
+                    if offset != 0:
+                        log.info(f"📐 PARITY SHIFT: Intended={intended_price:.5f} | Actual={request['price']:.5f} | Offset={offset:.5f}. Maintaining R:R.")
+
             # --- HARD LIMIT CHECK (SOURCE OF TRUTH) ---
             if request["action"] in [mt5.TRADE_ACTION_DEAL, mt5.TRADE_ACTION_PENDING]:
                 if not self._check_hard_trade_limit(raw_symbol):
                     return None # BLOCK TRADING
+
+            # --- Normalize the Absolute Price SL/TP sent by Linux ---
+            # EXECUTED BEFORE R:R EVALUATION TO PREVENT PRECISION FALSE POSITIVES
+            raw_sl = float(request.get("sl", 0.0))
+            if raw_sl > 0:
+                request["sl"] = PrecisionGuard.normalize_price(raw_sl, broker_sym, symbol_info)
+            
+            raw_tp = float(request.get("tp", 0.0))
+            if raw_tp > 0:
+                request["tp"] = PrecisionGuard.normalize_price(raw_tp, broker_sym, symbol_info)
 
             # --- STRICT R:R ENFORCEMENT AT THE METAL LAYER ---
             if request["action"] in [mt5.TRADE_ACTION_DEAL, mt5.TRADE_ACTION_PENDING]:
@@ -439,15 +466,6 @@ class MT5ExecutionEngine:
                     
                 request["volume"] = max(symbol_info.volume_min, min(request["volume"], symbol_info.volume_max))
 
-            # --- Normalize the Absolute Price SL/TP sent by Linux ---
-            raw_sl = float(request.get("sl", 0.0))
-            if raw_sl > 0:
-                request["sl"] = PrecisionGuard.normalize_price(raw_sl, broker_sym, symbol_info)
-            
-            raw_tp = float(request.get("tp", 0.0))
-            if raw_tp > 0:
-                request["tp"] = PrecisionGuard.normalize_price(raw_tp, broker_sym, symbol_info)
-            
             if request["action"] == mt5.TRADE_ACTION_PENDING:
                 request["type_filling"] = mt5.ORDER_FILLING_RETURN
             else:
@@ -766,16 +784,13 @@ class HybridProducer:
                     log.info(f"Subscribed to {sym}")
 
     def _reconstruct_risk_state_from_history(self):
-        log.info("Reconstructing Risk State (FTMO Compliance - Server Time Authority)...")
+        """
+        V20.12 TIME FIX: Relies strictly on MT5 Broker Time for finding Midnight.
+        """
+        log.info("Reconstructing Risk State (Server Time Authority)...")
         retry_count = 0
         max_retries = 5
         
-        risk_tz_str = CONFIG.get('risk_management', {}).get('risk_timezone', 'Europe/Prague')
-        try:
-            risk_tz = pytz.timezone(risk_tz_str)
-        except:
-            risk_tz = pytz.timezone('Europe/Prague')
-            
         while retry_count < max_retries:
             try:
                 with self.mt5_lock:
@@ -800,18 +815,16 @@ class HybridProducer:
                         safe_loss_pct = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.040)
                         self.ftmo_monitor.max_daily_loss = current_balance * safe_loss_pct
                     
-                    server_ts = time.time()
+                    server_ts = time.time() + self.exec_engine.broker_time_offset
                     for s in ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]:
                          tick = mt5.symbol_info_tick(s)
                          if tick:
                              server_ts = tick.time
                              break
                     
-                    dt_utc = datetime.fromtimestamp(server_ts, timezone.utc)
-                    dt_risk = dt_utc.astimezone(risk_tz)
-                    dt_midnight_risk = dt_risk.replace(hour=0, minute=0, second=0, microsecond=0)
-                    dt_midnight_utc = dt_midnight_risk.astimezone(timezone.utc)
-                    midnight_ts = dt_midnight_utc.timestamp()
+                    # Exact MT5 Broker Midnight
+                    midnight_ts = server_ts - (server_ts % 86400)
+                    utc_midnight_ts = midnight_ts - self.exec_engine.broker_time_offset
                     
                     deals = mt5.history_deals_get(float(midnight_ts), float(server_ts + 3600))
                     
@@ -827,13 +840,15 @@ class HybridProducer:
                     self.r.set(CONFIG['redis']['risk_keys']['daily_starting_equity'], calculated_start)
                     self.r.set("bot:account_size", self.ftmo_monitor.initial_balance) 
                     
-                    self.r.set("risk:last_reset_date", str(midnight_ts)) 
+                    self.r.set("risk:last_reset_date", str(utc_midnight_ts)) 
                     
                     safe_loss_pct = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.040)
                     loss_limit = calculated_start * safe_loss_pct
                     hard_deck = calculated_start - loss_limit
                     self.r.set("risk:hard_deck_level", hard_deck)
-                    log.info(f"{LogSymbols.SUCCESS} RISK STATE VERIFIED: Start Equity: {calculated_start:.2f} | Hard Deck: {hard_deck:.2f} | PnL Today: {realized_pnl_today:.2f} (Timezone: {risk_tz_str})")
+                    
+                    dt_broker = datetime.fromtimestamp(server_ts, timezone.utc)
+                    log.info(f"{LogSymbols.SUCCESS} RISK STATE VERIFIED: Start Equity: {calculated_start:.2f} | Hard Deck: {hard_deck:.2f} | PnL Today: {realized_pnl_today:.2f} (Broker Server Time: {dt_broker.strftime('%Y-%m-%d %H:%M')})")
                     return
             except Exception as e:
                 log.error(f"Risk Reconstruction Exception: {e}")
@@ -1254,6 +1269,7 @@ class HybridProducer:
                     "volume": float(data['volume']),
                     "type": order_type,
                     "price": exec_price, 
+                    "intended_price": data.get("intended_price", "0.0"), # Pass through to ExecutionEngine
                     "sl": float(data.get("sl", 0)), 
                     "tp": float(data.get("tp", 0)),
                     "magic": MAGIC_NUMBER, 
@@ -1395,6 +1411,10 @@ class HybridProducer:
             return False
 
     def _midnight_watchman_loop(self):
+        """
+        V20.12 TIME FIX: Relies strictly on MT5 Broker Time to find the true Midnight Anchor.
+        Double-shift timezone bugs fully eradicated.
+        """
         log.info("Starting Midnight Watchman (Server Time Authority)...")
         freeze_key = CONFIG['redis']['risk_keys']['midnight_freeze']
         daily_start_key = CONFIG['redis']['risk_keys']['daily_starting_equity']
@@ -1402,31 +1422,32 @@ class HybridProducer:
         
         last_anchor_id = None
         
-        risk_tz_str = CONFIG.get('risk_management', {}).get('risk_timezone', 'Europe/Prague')
-        try:
-            risk_tz = pytz.timezone(risk_tz_str)
-        except:
-            risk_tz = pytz.timezone('Europe/Prague')
-        
         while self.running and not self.stop_event.is_set():
             server_ts = time.time()
             try:
                 server_ts += self.exec_engine.broker_time_offset
             except: pass
             
-            dt_utc = datetime.fromtimestamp(server_ts, timezone.utc)
-            dt_risk = dt_utc.astimezone(risk_tz)
+            # server_ts is now NAIVE Broker Time in seconds.
+            # Interpreting it as UTC allows us to extract the exact hour/minute of the broker clock
+            # without python applying our local system timezone offsets.
+            dt_server = datetime.fromtimestamp(server_ts, timezone.utc)
             
-            hour = dt_risk.hour
-            minute = dt_risk.minute
+            hour = dt_server.hour
+            minute = dt_server.minute
             
             if (hour == 23 and minute >= 55) or (hour == 0 and minute <= 5):
                 self.r.set(freeze_key, "1")
                 
-                current_midnight_id = dt_risk.strftime("%Y-%m-%d") 
+                current_midnight_id = dt_server.strftime("%Y-%m-%d") 
                 
-                if hour == 0 and minute == 0 and current_midnight_id != last_anchor_id:
-                    log.warning(f"⚓ MIDNIGHT ANCHOR ({risk_tz_str}): Capturing Daily Starting Equity...")
+                if hour == 0 and minute <= 5 and current_midnight_id != last_anchor_id:
+                    log.warning(f"⚓ MIDNIGHT ANCHOR (Broker Time {dt_server.strftime('%H:%M')}): Capturing Daily Starting Equity...")
+                    
+                    midnight_broker_ts = server_ts - (server_ts % 86400)
+                    utc_midnight_ts = midnight_broker_ts - self.exec_engine.broker_time_offset
+                    self.r.set("risk:last_reset_date", str(utc_midnight_ts))
+                    
                     max_retries = 5
                     for attempt in range(max_retries):
                         with self.mt5_lock:
@@ -1524,7 +1545,7 @@ class HybridProducer:
             threading.Thread(target=self._maintain_time_sync, daemon=True) 
         ]
         for t in threads: t.start()
-        log.info(f"{LogSymbols.ONLINE} Windows Producer Running. Risk State: {self.ftmo_monitor.starting_equity_of_day} | V20.10 Expert Protocol Bridge Active")
+        log.info(f"{LogSymbols.ONLINE} Windows Producer Running. Risk State: {self.ftmo_monitor.starting_equity_of_day} | V20.12 True Time Sync Active")
         try:
             while self.running:
                 try:
