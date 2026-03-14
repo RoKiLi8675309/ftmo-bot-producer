@@ -346,6 +346,62 @@ class MT5ExecutionEngine:
             log.error(f"Hard Limit Check Failed: {e}", exc_info=True)
             return False 
 
+    def _safe_order_send(self, request: dict) -> Any:
+        """
+        Executes mt5.order_send with an automatic fallback mechanism for Ret:10030.
+        Queries the terminal for the exact allowed filling modes for the symbol.
+        """
+        symbol = request.get("symbol")
+        sym_info = mt5.symbol_info(symbol)
+        
+        allowed_modes = []
+        if sym_info is not None:
+            # Bitwise check against allowed filling modes (1 = FOK, 2 = IOC)
+            filling = sym_info.filling_mode
+            if filling & 1:
+                allowed_modes.append(mt5.ORDER_FILLING_FOK)
+            if filling & 2:
+                allowed_modes.append(mt5.ORDER_FILLING_IOC)
+                
+            # Always append RETURN as a fallback for CFD/Crypto/Indices
+            if mt5.ORDER_FILLING_RETURN not in allowed_modes:
+                allowed_modes.append(mt5.ORDER_FILLING_RETURN)
+
+        # Safety Fallback: If MT5 returns 0 or fails, try standard sequence
+        if not allowed_modes:
+            allowed_modes = [
+                mt5.ORDER_FILLING_FOK, 
+                mt5.ORDER_FILLING_IOC, 
+                mt5.ORDER_FILLING_RETURN
+            ]
+
+        # Prioritize the originally requested mode if it's strictly valid
+        requested_mode = request.get("type_filling", mt5.ORDER_FILLING_FOK)
+        if requested_mode in allowed_modes:
+            allowed_modes.remove(requested_mode)
+            allowed_modes.insert(0, requested_mode)
+            
+        result = None
+        for mode in allowed_modes:
+            request["type_filling"] = mode
+            result = mt5.order_send(request)
+            
+            # If MT5 internal failure (e.g., disconnected), break
+            if result is None:
+                log.error(f"MT5 order_send returned None for {symbol}")
+                break
+                
+            # 10030 = TRADE_RETCODE_INVALID_FILL
+            if result.retcode == 10030:
+                log.warning(f"Ret:10030 Unsupported filling mode '{mode}' for {symbol}. Trying next mode...")
+                time.sleep(0.1) # Micro-pause before retry
+                continue
+                
+            # If successful or failed for a DIFFERENT reason, break loop and return result
+            break
+            
+        return result
+
     def execute_trade(self, request: Dict[str, Any], max_retries: int = 3) -> Optional[Dict[str, Any]]:
         log.info(f"🏗️ BUILDING ORDER: {request.get('symbol')} {request.get('type')} Action: {request.get('action')}")
         
@@ -523,7 +579,7 @@ class MT5ExecutionEngine:
                         log.info(f"✅ Trade {signal_uuid} already exists. Skipping duplicate.")
                         return existing
 
-                result = mt5.order_send(mt5_request)
+                result = self._safe_order_send(mt5_request)
                 
                 if result is None:
                     err = mt5.last_error()
@@ -632,10 +688,10 @@ class MT5ExecutionEngine:
                 "type_filling": mt5.ORDER_FILLING_IOC
             }
             
-            result = mt5.order_send(request)
+            result = self._safe_order_send(request)
             
             if result is None:
-                log.error(f"❌ CLOSE ERROR: mt5.order_send returned None for {symbol} Ticket:{position_id}")
+                log.error(f"❌ CLOSE ERROR: order_send returned None for {symbol} Ticket:{position_id}")
                 return None
                 
             if result.retcode != mt5.TRADE_RETCODE_DONE:
@@ -968,12 +1024,26 @@ class HybridProducer:
             try:
                 # Watchdog Check
                 if time.time() - last_successful_tick_time > 60:
-                    log.warning("⚠️ No ticks for 60s! Attempting MT5 Reconnect...")
-                    with self.mt5_lock:
-                        mt5.shutdown()
-                        time.sleep(1)
-                        mt5.initialize()
-                        last_successful_tick_time = time.time()
+                    # FIX: Weekend Check to stop massive log spam when market is closed
+                    utc_now = datetime.now(timezone.utc)
+                    # Friday >= 21:00, Saturday (all), Sunday < 21:00 UTC
+                    is_weekend = (utc_now.weekday() == 4 and utc_now.hour >= 21) or \
+                                 (utc_now.weekday() == 5) or \
+                                 (utc_now.weekday() == 6 and utc_now.hour < 21)
+                    
+                    if is_weekend:
+                        if time.time() - getattr(self, 'last_weekend_log', 0) > 3600:
+                            log.info("🌴 Weekend detected. Market closed. Pausing MT5 reconnect watchdog to save logs.")
+                            self.last_weekend_log = time.time()
+                        last_successful_tick_time = time.time() # Reset watchdog to prevent loop
+                        time.sleep(10) # Throttle loop heavily during weekend
+                    else:
+                        log.warning("⚠️ No ticks for 60s! Attempting MT5 Reconnect...")
+                        with self.mt5_lock:
+                            mt5.shutdown()
+                            time.sleep(1)
+                            mt5.initialize()
+                            last_successful_tick_time = time.time()
 
                 if time.time() - self.last_context_update > 60:
                     self._update_d1_context()
@@ -1145,15 +1215,22 @@ class HybridProducer:
                 time.sleep(1)
 
     def _check_mt5_revenge_status(self, symbol: str) -> bool:
+        """
+        V20.15 FIX: Exponential Revenge Guard & Circuit Breaker.
+        Completely eliminates the 'machine-gunning' bug by scanning the last 24 hours
+        and applying exponentially increasing timeouts.
+        """
         try:
-            cooldown_mins = CONFIG.get('risk_management', {}).get('loss_cooldown_minutes', 60)
-            if cooldown_mins <= 0: return False
+            base_cooldown_mins = CONFIG.get('risk_management', {}).get('loss_cooldown_minutes', 15)
+            max_consecutive_losses = CONFIG.get('risk_management', {}).get('max_consecutive_losses', 3)
+            
+            if base_cooldown_mins <= 0: return False
 
             broker_sym = self.exec_engine.symbol_map.get(symbol, symbol)
             
             with self.mt5_lock:
                 server_now_ts = time.time() + self.exec_engine.broker_time_offset
-                from_ts = server_now_ts - 86400 
+                from_ts = server_now_ts - 86400 # Rolling 24-hour window for absolute safety
                 to_ts = server_now_ts + 3600 
                 
                 deals = mt5.history_deals_get(float(from_ts), float(to_ts))
@@ -1161,28 +1238,50 @@ class HybridProducer:
                 if deals:
                     relevant_deals = [
                         d for d in deals 
-                        if d.symbol == broker_sym and d.magic == int(self.exec_engine.magic_number)
+                        if d.symbol == broker_sym 
+                        and d.magic == int(self.exec_engine.magic_number)
+                        and d.entry in [mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT]
                     ]
                     
+                    if not relevant_deals:
+                        return False
+                        
                     sorted_deals = sorted(relevant_deals, key=lambda x: x.time, reverse=True)
                     
+                    # 1. Count Consecutive Losses
+                    consecutive_losses = 0
                     for deal in sorted_deals:
-                        time.sleep(0.001) 
-                        time_since_close = server_now_ts - deal.time
-                        
-                        if time_since_close < (cooldown_mins * 60):
-                            if deal.entry in [mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT]:
-                                net_pnl = deal.profit + deal.swap + deal.commission
-                                expiry_in = int((cooldown_mins * 60) - time_since_close)
-                                
-                                if net_pnl < 0:
-                                    log.warning(f"🛑 REVENGE GUARD: {symbol} BLOCKED. Loss {net_pnl:.2f} at {deal.time} (Server Time). Expiry in {expiry_in}s")
-                                else:
-                                    log.warning(f"🛡️ MANDATORY COOLDOWN: {symbol} BLOCKED. Win/BE {net_pnl:.2f} at {deal.time}. Expiry in {expiry_in}s")
-                                
-                                return True 
+                        net_pnl = deal.profit + deal.swap + deal.commission
+                        if net_pnl < 0:
+                            consecutive_losses += 1
                         else:
-                            break
+                            break # Streak broken by a win or BE
+                            
+                    # 2. Daily Circuit Breaker per Symbol
+                    if consecutive_losses >= max_consecutive_losses:
+                        log.critical(f"💀💀💀 CIRCUIT BREAKER TRIPPED: {symbol} has {consecutive_losses} consecutive losses. BLOCKED FOR 24 HOURS.")
+                        return True
+                        
+                    # 3. Time-Based Exponential Cooldown
+                    most_recent_deal = sorted_deals[0]
+                    time_since_close = server_now_ts - most_recent_deal.time
+                    net_pnl_recent = most_recent_deal.profit + most_recent_deal.swap + most_recent_deal.commission
+                    
+                    if net_pnl_recent < 0:
+                        # Exponential Cooldown for Losses: base * 1, base * 2, base * 4...
+                        multiplier = 2 ** (consecutive_losses - 1)
+                        effective_cooldown = base_cooldown_mins * multiplier
+                        
+                        if time_since_close < (effective_cooldown * 60):
+                            expiry_in = int((effective_cooldown * 60) - time_since_close)
+                            log.warning(f"🛑 EXPONENTIAL REVENGE GUARD: {symbol} BLOCKED. Loss {net_pnl_recent:.2f}. Streak: {consecutive_losses}. Penalty: {multiplier}x ({effective_cooldown}m). Expiry in {expiry_in}s")
+                            return True
+                    else:
+                        # Standard Cooldown for Wins/BE
+                        if time_since_close < (base_cooldown_mins * 60):
+                            expiry_in = int((base_cooldown_mins * 60) - time_since_close)
+                            log.warning(f"🛡️ MANDATORY COOLDOWN: {symbol} BLOCKED. Win/BE {net_pnl_recent:.2f}. Expiry in {expiry_in}s")
+                            return True
                             
         except Exception as e:
             log.error(f"Revenge Guard Check Failed: {e}")
