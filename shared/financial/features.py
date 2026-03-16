@@ -406,7 +406,7 @@ class RegimeDetector:
                 self.model = hmm.GaussianHMM(
                     n_components=n_states,
                     covariance_type="diag",
-                    n_iter=100,
+                    n_iter=20, # V20.18 FIX: Reduced from 100 to prevent GIL blocking tick processing
                     random_state=42,
                     init_params="stmc",
                     verbose=False,
