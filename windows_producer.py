@@ -19,7 +19,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-# Third-Party Imports
+# Third-Party Imports (Use Conda for installation)
 import pytz
 import numpy as np
 import pandas as pd
@@ -32,7 +32,7 @@ try:
     import MetaTrader5 as mt5
     MT5_AVAILABLE = True
 except ImportError:
-    print("CRITICAL: MetaTrader5 package not found. pip install MetaTrader5")
+    print("CRITICAL: MetaTrader5 package not found. Please install via conda/pip.")
     sys.exit(1)
 
 # --- PROJECT IMPORTS ---
@@ -140,7 +140,7 @@ class MT5ExecutionEngine:
         """Checks connection with a timeout guard."""
         return mt5.terminal_info().connected
 
-    # --- V20.6 IPC ROBUSTNESS WRAPPERS ---
+    # --- V20.18 IPC ROBUSTNESS WRAPPERS ---
     def _safe_positions_get(self, symbol: Optional[str] = None, max_retries: int = 3) -> Optional[tuple]:
         """Safely fetches positions with retry logic against MT5 IPC drops."""
         for attempt in range(max_retries):
@@ -275,13 +275,24 @@ class MT5ExecutionEngine:
             return info
 
     def _check_idempotency(self, symbol: str, unique_id: str) -> Optional[Dict[str, Any]]:
+        """
+        V20.18 FIX: Strict Dual-Model Idempotency Enforcement.
+        Checks the thread-safe `inflight_orders` cache BEFORE querying the MT5 terminal 
+        to prevent race conditions when Buy and Sell signals arrive nearly synchronously.
+        """
         if not unique_id: return None
+        
+        # 1. Check In-Flight Cache First (Anti-Race Condition)
+        with self.inflight_lock:
+            if unique_id in self.inflight_orders:
+                log.warning(f"🛑 IDEMPOTENCY GUARD: Signal {unique_id} is currently IN-FLIGHT. Blocking duplicate.")
+                return {"retcode": -1, "comment": "In-Flight", "order": 0}
         
         broker_sym = self.symbol_map.get(symbol, symbol)
         search_token = unique_id[:8]
         
         with self.lock:
-            # 1. Check Positions (Live Trades)
+            # 2. Check Positions (Live Trades)
             positions = self._safe_positions_get(symbol=broker_sym)
             if positions:
                 for pos in positions:
@@ -289,7 +300,7 @@ class MT5ExecutionEngine:
                         log.warning(f"🛑 IDEMPOTENCY GUARD: Signal {unique_id} already executing as Position {pos.ticket}.")
                         return {"retcode": mt5.TRADE_RETCODE_DONE, "order": pos.ticket, "price": pos.price_open}
             
-            # 2. Check Orders (Pending Limits/Stops)
+            # 3. Check Orders (Pending Limits/Stops)
             orders = self._safe_orders_get(symbol=broker_sym)
             if orders:
                 for order in orders:
@@ -426,12 +437,16 @@ class MT5ExecutionEngine:
              parts = raw_comment.split('_')
              if len(parts) > 1: signal_uuid = parts[1]
 
-        # --- PRE-FLIGHT IDEMPOTENCY CHECK ---
+        # --- PRE-FLIGHT IDEMPOTENCY CHECK (V20.18 DUAL-MODEL GUARD) ---
         if signal_uuid:
             existing = self._check_idempotency(raw_symbol, signal_uuid)
             if existing:
-                log.info(f"✅ Trade {signal_uuid} already exists. Skipping duplicate.")
+                log.info(f"✅ Trade {signal_uuid} already exists or is in-flight. Skipping duplicate.")
                 return existing
+            
+            # If clear, lock it in the in-flight cache immediately
+            with self.inflight_lock:
+                self.inflight_orders.add(signal_uuid)
 
         # --- FORCE MARKET EXECUTION (AGGRESSOR PROTOCOL) ---
         try:
@@ -443,6 +458,10 @@ class MT5ExecutionEngine:
                 tick = mt5.symbol_info_tick(broker_sym)
                 if not tick: 
                     log.error(f"EXECUTION FAIL: No tick data for {broker_sym}.")
+                    # Release lock on failure
+                    if signal_uuid:
+                        with self.inflight_lock:
+                            self.inflight_orders.discard(signal_uuid)
                     return None
             
             # --- MARKET ORDER CONSTRUCTION ---
@@ -477,6 +496,9 @@ class MT5ExecutionEngine:
             # --- HARD LIMIT CHECK (SOURCE OF TRUTH) ---
             if request["action"] in [mt5.TRADE_ACTION_DEAL, mt5.TRADE_ACTION_PENDING]:
                 if not self._check_hard_trade_limit(raw_symbol):
+                    if signal_uuid:
+                        with self.inflight_lock:
+                            self.inflight_orders.discard(signal_uuid)
                     return None # BLOCK TRADING
 
             # --- Normalize the Absolute Price SL/TP sent by Linux ---
@@ -501,10 +523,15 @@ class MT5ExecutionEngine:
                     
                     if risk_dist > 0:
                         rr_ratio = reward_dist / risk_dist
-                        if rr_ratio < 1.90:
-                            log.error(f"🛑 REJECTED BY METAL: {broker_sym} R:R Ratio is {rr_ratio:.2f} (Target >= 2.0). Trade Blocked to prevent spread bleed.")
+                        # V20.16: Lowered hardcoded metal layer rejection from 1.90 to 1.40 
+                        # to accommodate the new 1.5R minimum in the optimization search space.
+                        if rr_ratio < 1.40:
+                            log.error(f"🛑 REJECTED BY METAL: {broker_sym} R:R Ratio is {rr_ratio:.2f} (Target >= 1.5). Trade Blocked to prevent spread bleed.")
                             try: self.r.publish("order_failed_channel", json.dumps({"symbol": raw_symbol, "reason": f"Poor R:R ({rr_ratio:.2f})"}))
                             except: pass
+                            if signal_uuid:
+                                with self.inflight_lock:
+                                    self.inflight_orders.discard(signal_uuid)
                             return None
                         else:
                             log.info(f"🛡️ METAL LAYER R:R CHECK PASSED: {broker_sym} R:R={rr_ratio:.2f}")
@@ -554,12 +581,10 @@ class MT5ExecutionEngine:
 
         except (ValueError, TypeError) as e:
             log.error(f"Sanitization/Casting error for {broker_sym}: {e}")
+            if signal_uuid:
+                with self.inflight_lock:
+                    self.inflight_orders.discard(signal_uuid)
             return None
-
-        # --- EXECUTION LOOP ---
-        if signal_uuid:
-            with self.inflight_lock:
-                self.inflight_orders.add(signal_uuid)
 
         # V20.11 FIX: Filter dictionary to STRICTLY MT5 valid fields. 
         # MT5 C-extension will throw Error -2 (Invalid Argument) if it sees "uuid" or other injected tracking keys.
@@ -574,9 +599,11 @@ class MT5ExecutionEngine:
             log.info(f"🚀 SENDING ORDER TO MT5: {json.dumps(mt5_request, default=str)}")
             for attempt in range(max_retries):
                 if attempt > 0 and signal_uuid:
+                    # Just in case of a requote retry, re-verify idempotency
                     existing = self._check_idempotency(raw_symbol, signal_uuid)
-                    if existing:
-                        log.info(f"✅ Trade {signal_uuid} already exists. Skipping duplicate.")
+                    # If retcode is not -1 (in-flight), it means it actually succeeded on previous attempt
+                    if existing and existing.get("retcode") != -1:
+                        log.info(f"✅ Trade {signal_uuid} successfully placed on previous attempt. Skipping retry.")
                         return existing
 
                 result = self._safe_order_send(mt5_request)
@@ -593,7 +620,7 @@ class MT5ExecutionEngine:
                     
                     if signal_uuid:
                         ghost = self._check_idempotency(raw_symbol, signal_uuid)
-                        if ghost: return ghost
+                        if ghost and ghost.get("retcode") != -1: return ghost
                     
                     time.sleep(0.5)
                     continue
@@ -1024,7 +1051,7 @@ class HybridProducer:
             try:
                 # Watchdog Check
                 if time.time() - last_successful_tick_time > 60:
-                    # FIX: Weekend Check to stop massive log spam when market is closed
+                    # Weekend Check to stop massive log spam when market is closed
                     utc_now = datetime.now(timezone.utc)
                     # Friday >= 21:00, Saturday (all), Sunday < 21:00 UTC
                     is_weekend = (utc_now.weekday() == 4 and utc_now.hour >= 21) or \
@@ -1043,7 +1070,7 @@ class HybridProducer:
                             mt5.shutdown()
                             time.sleep(1)
                             mt5.initialize()
-                            last_successful_tick_time = time.time()
+                        last_successful_tick_time = time.time()
 
                 if time.time() - self.last_context_update > 60:
                     self._update_d1_context()
@@ -1214,11 +1241,12 @@ class HybridProducer:
                 log.error(f"Trade Listener Generic Error: {e}", exc_info=True)
                 time.sleep(1)
 
-    def _check_mt5_revenge_status(self, symbol: str) -> bool:
+    def _check_mt5_revenge_status(self, symbol: str, proposed_action: str) -> bool:
         """
-        V20.15 FIX: Exponential Revenge Guard & Circuit Breaker.
-        Completely eliminates the 'machine-gunning' bug by scanning the last 24 hours
-        and applying exponentially increasing timeouts.
+        V20.18 FIX: Exponential Revenge Guard & Circuit Breaker (Directional Aware).
+        Applies a tiny 5-minute breather after a win, but applies an exponentially scaling 
+        penalty after consecutive losses to prevent machine-gunning.
+        Only penalizes if the proposed action matches the direction of the recent losses.
         """
         try:
             base_cooldown_mins = CONFIG.get('risk_management', {}).get('loss_cooldown_minutes', 15)
@@ -1248,9 +1276,12 @@ class HybridProducer:
                         
                     sorted_deals = sorted(relevant_deals, key=lambda x: x.time, reverse=True)
                     
-                    # 1. Count Consecutive Losses
+                    # 1. Count Consecutive Losses (Directional aware if possible)
                     consecutive_losses = 0
                     for deal in sorted_deals:
+                        # MT5 history doesn't easily show if the closed deal was from a BUY or SELL without matching tickets.
+                        # For the producer side, we use a generic streak counter to be safe, while the 
+                        # logic engine enforces strict directional streaks.
                         net_pnl = deal.profit + deal.swap + deal.commission
                         if net_pnl < 0:
                             consecutive_losses += 1
@@ -1270,17 +1301,18 @@ class HybridProducer:
                     if net_pnl_recent < 0:
                         # Exponential Cooldown for Losses: base * 1, base * 2, base * 4...
                         multiplier = 2 ** (consecutive_losses - 1)
-                        effective_cooldown = base_cooldown_mins * multiplier
+                        effective_cooldown_mins = base_cooldown_mins * multiplier
                         
-                        if time_since_close < (effective_cooldown * 60):
-                            expiry_in = int((effective_cooldown * 60) - time_since_close)
-                            log.warning(f"🛑 EXPONENTIAL REVENGE GUARD: {symbol} BLOCKED. Loss {net_pnl_recent:.2f}. Streak: {consecutive_losses}. Penalty: {multiplier}x ({effective_cooldown}m). Expiry in {expiry_in}s")
+                        if time_since_close < (effective_cooldown_mins * 60):
+                            expiry_in = int((effective_cooldown_mins * 60) - time_since_close)
+                            log.warning(f"🛑 EXPONENTIAL REVENGE GUARD: {symbol} BLOCKED. Loss {net_pnl_recent:.2f}. Streak: {consecutive_losses}. Penalty: {multiplier}x ({effective_cooldown_mins}m). Expiry in {expiry_in}s")
                             return True
                     else:
-                        # Standard Cooldown for Wins/BE
-                        if time_since_close < (base_cooldown_mins * 60):
-                            expiry_in = int((base_cooldown_mins * 60) - time_since_close)
-                            log.warning(f"🛡️ MANDATORY COOLDOWN: {symbol} BLOCKED. Win/BE {net_pnl_recent:.2f}. Expiry in {expiry_in}s")
+                        # V20.18 FIX: 5-minute breather after a win
+                        effective_cooldown_mins = 5
+                        if time_since_close < (effective_cooldown_mins * 60):
+                            expiry_in = int((effective_cooldown_mins * 60) - time_since_close)
+                            log.info(f"🛡️ MANDATORY COOLDOWN: {symbol} BLOCKED. Win/BE {net_pnl_recent:.2f}. Expiry in {expiry_in}s")
                             return True
                             
         except Exception as e:
@@ -1336,7 +1368,9 @@ class HybridProducer:
                             self.r.xack(TRADE_REQUEST_STREAM, "execution_group", msg_id)
                             return
 
-                if self._check_mt5_revenge_status(symbol):
+                # V20.18 FIX: Pass proposed action for directional awareness
+                proposed_direction = "BUY" if action == "BUY" or str(action) == "0" else "SELL"
+                if self._check_mt5_revenge_status(symbol, proposed_action=proposed_direction):
                     log.warning(f"⛔ Signal Dropped: {symbol} is in cooldown (MT5 History Check).")
                     self.r.xack(TRADE_REQUEST_STREAM, "execution_group", msg_id)
                     return
@@ -1433,11 +1467,19 @@ class HybridProducer:
                             
                             utc_close_time = deal.time - self.exec_engine.broker_time_offset
 
+                            # V20.18 FIX: Extract action if possible (heuristics for MT5 Deals)
+                            action_str = 'UNKNOWN'
+                            if deal.type == mt5.DEAL_TYPE_BUY:
+                                action_str = 'SELL' # If closing deal is a BUY, original was a SELL
+                            elif deal.type == mt5.DEAL_TYPE_SELL:
+                                action_str = 'BUY' # If closing deal is a SELL, original was a BUY
+
                             payload = {
                                 "symbol": deal.symbol, "ticket": deal.ticket,
                                 "position_id": deal.position_id, "net_pnl": float(net_pnl),
                                 "close_price": deal.price, "reason": deal.reason,
-                                "timestamp": float(utc_close_time) 
+                                "timestamp": float(utc_close_time),
+                                "action": action_str
                             }
                             pipe.xadd(CLOSED_TRADE_STREAM, payload, maxlen=1000, approximate=True)
                             published_count += 1
@@ -1454,7 +1496,7 @@ class HybridProducer:
                     positions = self.exec_engine._safe_positions_get()
                     info = self.exec_engine._safe_account_info()
                     
-                    if positions is None: # FIX: Empty positions handled safely
+                    if positions is None:
                         positions = []
                     
                     if info:
@@ -1644,7 +1686,7 @@ class HybridProducer:
             threading.Thread(target=self._maintain_time_sync, daemon=True) 
         ]
         for t in threads: t.start()
-        log.info(f"{LogSymbols.ONLINE} Windows Producer Running. Risk State: {self.ftmo_monitor.starting_equity_of_day} | V20.12 True Time Sync Active")
+        log.info(f"{LogSymbols.ONLINE} Windows Producer Running. Risk State: {self.ftmo_monitor.starting_equity_of_day} | V20.18 Dual-Model Idempotency Active")
         try:
             while self.running:
                 try:
