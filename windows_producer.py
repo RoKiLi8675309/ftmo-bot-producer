@@ -1279,14 +1279,21 @@ class HybridProducer:
                     # 1. Count Consecutive Losses (Directional aware if possible)
                     consecutive_losses = 0
                     for deal in sorted_deals:
-                        # MT5 history doesn't easily show if the closed deal was from a BUY or SELL without matching tickets.
-                        # For the producer side, we use a generic streak counter to be safe, while the 
-                        # logic engine enforces strict directional streaks.
                         net_pnl = deal.profit + deal.swap + deal.commission
-                        if net_pnl < 0:
-                            consecutive_losses += 1
-                        else:
-                            break # Streak broken by a win or BE
+                        
+                        # Infer original trade direction based on closing deal type
+                        deal_action = 'UNKNOWN'
+                        if deal.type == mt5.DEAL_TYPE_BUY:
+                            deal_action = 'SELL'
+                        elif deal.type == mt5.DEAL_TYPE_SELL:
+                            deal_action = 'BUY'
+                            
+                        # Only evaluate streaks for the proposed direction
+                        if deal_action in [proposed_action, 'UNKNOWN']:
+                            if net_pnl < 0:
+                                consecutive_losses += 1
+                            else:
+                                break # Streak broken by a win or BE in this direction
                             
                     # 2. Daily Circuit Breaker per Symbol
                     if consecutive_losses >= max_consecutive_losses:
