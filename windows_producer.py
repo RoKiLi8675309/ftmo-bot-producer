@@ -868,7 +868,9 @@ class HybridProducer:
 
     def _reconstruct_risk_state_from_history(self):
         """
-        V20.12 TIME FIX: Relies strictly on MT5 Broker Time for finding Midnight.
+        V20.18 FIX: Eliminates the mid-day restart FTMO violation.
+        Prioritizes the Redis cached `daily_starting_equity` which preserves 
+        floating PnL across restarts, falling back to MT5 history ONLY if completely necessary.
         """
         log.info("Reconstructing Risk State (Server Time Authority)...")
         retry_count = 0
@@ -909,6 +911,27 @@ class HybridProducer:
                     midnight_ts = server_ts - (server_ts % 86400)
                     utc_midnight_ts = midnight_ts - self.exec_engine.broker_time_offset
                     
+                    safe_loss_pct = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.040)
+
+                    # --- 🚨 CRITICAL FIX: PRESERVE FLOATING PNL OVER MIDNIGHT ---
+                    try:
+                        cached_reset_date = self.r.get("risk:last_reset_date")
+                        if cached_reset_date and float(cached_reset_date) == utc_midnight_ts:
+                            cached_start_equity = self.r.get(CONFIG['redis']['risk_keys']['daily_starting_equity'])
+                            if cached_start_equity:
+                                self.ftmo_monitor.starting_equity_of_day = float(cached_start_equity)
+                                loss_limit = self.ftmo_monitor.starting_equity_of_day * safe_loss_pct
+                                hard_deck = self.ftmo_monitor.starting_equity_of_day - loss_limit
+                                self.r.set("risk:hard_deck_level", hard_deck)
+                                
+                                dt_broker = datetime.fromtimestamp(server_ts, timezone.utc)
+                                log.info(f"{LogSymbols.SUCCESS} RISK STATE RESTORED FROM REDIS CACHE (Mid-day Rescue): Start Equity: {self.ftmo_monitor.starting_equity_of_day:.2f} | Hard Deck: {hard_deck:.2f} (Broker Server Time: {dt_broker.strftime('%Y-%m-%d %H:%M')})")
+                                return
+                    except Exception as e:
+                        log.warning(f"Failed to fetch cached risk state from Redis, falling back to MT5 History: {e}")
+
+                    # --- FALLBACK: MT5 HISTORY (If Redis was flushed or it's a new day) ---
+                    log.info("No valid Redis cache for today. Calculating from MT5 History...")
                     deals = mt5.history_deals_get(float(midnight_ts), float(server_ts + 3600))
                     
                     realized_pnl_today = 0.0
@@ -925,13 +948,12 @@ class HybridProducer:
                     
                     self.r.set("risk:last_reset_date", str(utc_midnight_ts)) 
                     
-                    safe_loss_pct = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.040)
                     loss_limit = calculated_start * safe_loss_pct
                     hard_deck = calculated_start - loss_limit
                     self.r.set("risk:hard_deck_level", hard_deck)
                     
                     dt_broker = datetime.fromtimestamp(server_ts, timezone.utc)
-                    log.info(f"{LogSymbols.SUCCESS} RISK STATE VERIFIED: Start Equity: {calculated_start:.2f} | Hard Deck: {hard_deck:.2f} | PnL Today: {realized_pnl_today:.2f} (Broker Server Time: {dt_broker.strftime('%Y-%m-%d %H:%M')})")
+                    log.info(f"{LogSymbols.SUCCESS} RISK STATE VERIFIED (MT5 History): Start Equity: {calculated_start:.2f} | Hard Deck: {hard_deck:.2f} | PnL Today: {realized_pnl_today:.2f} (Broker Server Time: {dt_broker.strftime('%Y-%m-%d %H:%M')})")
                     return
             except Exception as e:
                 log.error(f"Risk Reconstruction Exception: {e}")
