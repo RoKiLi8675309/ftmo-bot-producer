@@ -117,8 +117,8 @@ class MT5ExecutionEngine:
         self.risk_monitor = risk_monitor
         self.broker_time_offset = 0.0
         
-        # Local Cache for In-Flight Orders (Anti-Race Condition)
-        self.inflight_orders = set() 
+        # Local Cache for In-Flight Orders (Anti-Race Condition TTL Dictionary)
+        self.inflight_orders: Dict[str, float] = {} 
         self.inflight_lock = threading.Lock()
 
         # Symbol Mapping (Raw -> Broker Specific)
@@ -276,14 +276,19 @@ class MT5ExecutionEngine:
 
     def _check_idempotency(self, symbol: str, unique_id: str) -> Optional[Dict[str, Any]]:
         """
-        V20.18 FIX: Strict Dual-Model Idempotency Enforcement.
-        Checks the thread-safe `inflight_orders` cache BEFORE querying the MT5 terminal 
-        to prevent race conditions when Buy and Sell signals arrive nearly synchronously.
+        V20.18.1 FIX: Time-to-Live Dictionary Cache.
+        Prevents race conditions by maintaining the lock memory for exactly 5.0 seconds
+        so MT5's asynchronous positions_get() can catch up to reality.
         """
         if not unique_id: return None
         
-        # 1. Check In-Flight Cache First (Anti-Race Condition)
+        now = time.time()
+        # 1. Clean expired keys and Check In-Flight Cache (Anti-Race Condition)
         with self.inflight_lock:
+            expired_keys = [k for k, v in self.inflight_orders.items() if now - v > 5.0]
+            for k in expired_keys:
+                del self.inflight_orders[k]
+
             if unique_id in self.inflight_orders:
                 log.warning(f"🛑 IDEMPOTENCY GUARD: Signal {unique_id} is currently IN-FLIGHT. Blocking duplicate.")
                 return {"retcode": -1, "comment": "In-Flight", "order": 0}
@@ -437,16 +442,16 @@ class MT5ExecutionEngine:
              parts = raw_comment.split('_')
              if len(parts) > 1: signal_uuid = parts[1]
 
-        # --- PRE-FLIGHT IDEMPOTENCY CHECK (V20.18 DUAL-MODEL GUARD) ---
+        # --- PRE-FLIGHT IDEMPOTENCY CHECK (V20.18.1 TTL GUARD) ---
         if signal_uuid:
             existing = self._check_idempotency(raw_symbol, signal_uuid)
             if existing:
                 log.info(f"✅ Trade {signal_uuid} already exists or is in-flight. Skipping duplicate.")
                 return existing
             
-            # If clear, lock it in the in-flight cache immediately
+            # If clear, lock it in the in-flight cache immediately with timestamp
             with self.inflight_lock:
-                self.inflight_orders.add(signal_uuid)
+                self.inflight_orders[signal_uuid] = time.time()
 
         # --- FORCE MARKET EXECUTION (AGGRESSOR PROTOCOL) ---
         try:
@@ -458,10 +463,11 @@ class MT5ExecutionEngine:
                 tick = mt5.symbol_info_tick(broker_sym)
                 if not tick: 
                     log.error(f"EXECUTION FAIL: No tick data for {broker_sym}.")
-                    # Release lock on failure
+                    # Hard release on absolute failure before terminal contact
                     if signal_uuid:
                         with self.inflight_lock:
-                            self.inflight_orders.discard(signal_uuid)
+                            if signal_uuid in self.inflight_orders:
+                                del self.inflight_orders[signal_uuid]
                     return None
             
             # --- MARKET ORDER CONSTRUCTION ---
@@ -498,7 +504,8 @@ class MT5ExecutionEngine:
                 if not self._check_hard_trade_limit(raw_symbol):
                     if signal_uuid:
                         with self.inflight_lock:
-                            self.inflight_orders.discard(signal_uuid)
+                            if signal_uuid in self.inflight_orders:
+                                del self.inflight_orders[signal_uuid]
                     return None # BLOCK TRADING
 
             # --- Normalize the Absolute Price SL/TP sent by Linux ---
@@ -531,7 +538,8 @@ class MT5ExecutionEngine:
                             except: pass
                             if signal_uuid:
                                 with self.inflight_lock:
-                                    self.inflight_orders.discard(signal_uuid)
+                                    if signal_uuid in self.inflight_orders:
+                                        del self.inflight_orders[signal_uuid]
                             return None
                         else:
                             log.info(f"🛡️ METAL LAYER R:R CHECK PASSED: {broker_sym} R:R={rr_ratio:.2f}")
@@ -583,7 +591,8 @@ class MT5ExecutionEngine:
             log.error(f"Sanitization/Casting error for {broker_sym}: {e}")
             if signal_uuid:
                 with self.inflight_lock:
-                    self.inflight_orders.discard(signal_uuid)
+                    if signal_uuid in self.inflight_orders:
+                        del self.inflight_orders[signal_uuid]
             return None
 
         # V20.11 FIX: Filter dictionary to STRICTLY MT5 valid fields. 
@@ -687,9 +696,10 @@ class MT5ExecutionEngine:
                     break
             return None
         finally:
-            if signal_uuid:
-                with self.inflight_lock:
-                    self.inflight_orders.discard(signal_uuid)
+            # V20.18 FIX: We intentionally DO NOT REMOVE the unique_id here.
+            # We let it naturally age out in the _check_idempotency loop after 5 seconds
+            # to guarantee MT5 state syncing catches up.
+            pass
 
     def close_position(self, position_id: int, symbol: str, volume: float, pos_type: int) -> Optional[Any]:
         with self.lock:
@@ -1024,10 +1034,10 @@ class HybridProducer:
             self.conn.commit()
 
     def _ensure_conversion_pairs(self) -> Set[str]:
-        monitored = set(ALL_MONITORED_SYMBOLS)
+        monored = set(ALL_MONITORED_SYMBOLS)
         with self.mt5_lock:
             account_info = self.exec_engine._safe_account_info()
-            if not account_info: return monitored
+            if not account_info: return monored
             
             acc_ccy = account_info.currency
             for sym in SYMBOLS:
@@ -1039,9 +1049,9 @@ class HybridProducer:
                     candidates = [f"{profit_ccy}{acc_ccy}", f"{acc_ccy}{profit_ccy}"]
                     for c in candidates:
                         if mt5.symbol_select(c, True):
-                            monitored.add(c)
+                            monored.add(c)
                             break
-        return monitored
+        return monored
 
     def _estimate_flow_volumes(self, symbol: str, current_vol: float, current_price: float) -> Tuple[float, float]:
         try:
