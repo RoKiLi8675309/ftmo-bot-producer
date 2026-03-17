@@ -45,9 +45,7 @@ try:
         SessionGuard,
         NewsEventMonitor,
         FTMOComplianceGuard,
-        PrecisionGuard,
-        ClusterContextBuilder,
-        TimeFeatureTransformer
+        PrecisionGuard
     )
 except ImportError as e:
     print(f"CRITICAL: Failed to import 'shared' module. Ensure you are running from the project root.\nError: {e}")
@@ -276,22 +274,10 @@ class MT5ExecutionEngine:
 
     def _check_idempotency(self, symbol: str, unique_id: str) -> Optional[Dict[str, Any]]:
         """
-        V20.18.1 FIX: Time-to-Live Dictionary Cache.
-        Prevents race conditions by maintaining the lock memory for exactly 5.0 seconds
-        so MT5's asynchronous positions_get() can catch up to reality.
+        Queries MT5 to ensure the trade doesn't already exist.
+        In-flight cache logic moved to execute_trade to prevent race conditions.
         """
         if not unique_id: return None
-        
-        now = time.time()
-        # 1. Clean expired keys and Check In-Flight Cache (Anti-Race Condition)
-        with self.inflight_lock:
-            expired_keys = [k for k, v in self.inflight_orders.items() if now - v > 5.0]
-            for k in expired_keys:
-                del self.inflight_orders[k]
-
-            if unique_id in self.inflight_orders:
-                log.warning(f"🛑 IDEMPOTENCY GUARD: Signal {unique_id} is currently IN-FLIGHT. Blocking duplicate.")
-                return {"retcode": -1, "comment": "In-Flight", "order": 0}
         
         broker_sym = self.symbol_map.get(symbol, symbol)
         search_token = unique_id[:8]
@@ -442,16 +428,26 @@ class MT5ExecutionEngine:
              parts = raw_comment.split('_')
              if len(parts) > 1: signal_uuid = parts[1]
 
-        # --- PRE-FLIGHT IDEMPOTENCY CHECK (V20.18.1 TTL GUARD) ---
+        # --- PRE-FLIGHT IDEMPOTENCY CHECK (ATOMIC TTL GUARD) ---
         if signal_uuid:
-            existing = self._check_idempotency(raw_symbol, signal_uuid)
-            if existing:
-                log.info(f"✅ Trade {signal_uuid} already exists or is in-flight. Skipping duplicate.")
-                return existing
-            
-            # If clear, lock it in the in-flight cache immediately with timestamp
             with self.inflight_lock:
-                self.inflight_orders[signal_uuid] = time.time()
+                now = time.time()
+                # Clean expired keys instantly
+                expired_keys = [k for k, v in self.inflight_orders.items() if now - v > 5.0]
+                for k in expired_keys: del self.inflight_orders[k]
+
+                if signal_uuid in self.inflight_orders:
+                    log.warning(f"🛑 IDEMPOTENCY GUARD: Signal {signal_uuid} is currently IN-FLIGHT. Blocking duplicate.")
+                    return {"retcode": -1, "comment": "In-Flight", "order": 0}
+                
+                # Claim the ID atomically before querying MT5
+                self.inflight_orders[signal_uuid] = now
+            
+            # Now safely query MT5 IPC
+            existing = self._check_idempotency(raw_symbol, signal_uuid)
+            if existing and existing.get("retcode") != -1:
+                log.info(f"✅ Trade {signal_uuid} already exists in MT5. Skipping.")
+                return existing
 
         # --- FORCE MARKET EXECUTION (AGGRESSOR PROTOCOL) ---
         try:
@@ -793,8 +789,7 @@ class HybridProducer:
         self.session_guard = SessionGuard()
         self.news_monitor = NewsEventMonitor()
         self.compliance_guard = FTMOComplianceGuard([])
-        self.time_engine = TimeFeatureTransformer()
-        self.cluster_engine = ClusterContextBuilder(SYMBOLS)
+        
         self.d1_cache = {p: {} for p in SYMBOLS}
         self.h4_cache = {p: {} for p in SYMBOLS}
         self.last_context_update = 0
@@ -930,7 +925,8 @@ class HybridProducer:
                             cached_start_equity = self.r.get(CONFIG['redis']['risk_keys']['daily_starting_equity'])
                             if cached_start_equity:
                                 self.ftmo_monitor.starting_equity_of_day = float(cached_start_equity)
-                                loss_limit = self.ftmo_monitor.starting_equity_of_day * safe_loss_pct
+                                # 🚨 CRITICAL FIX: Loss limit must map to INITIAL balance
+                                loss_limit = self.ftmo_monitor.initial_balance * safe_loss_pct
                                 hard_deck = self.ftmo_monitor.starting_equity_of_day - loss_limit
                                 self.r.set("risk:hard_deck_level", hard_deck)
                                 
@@ -958,7 +954,8 @@ class HybridProducer:
                     
                     self.r.set("risk:last_reset_date", str(utc_midnight_ts)) 
                     
-                    loss_limit = calculated_start * safe_loss_pct
+                    # 🚨 CRITICAL FIX: Loss limit must map to INITIAL balance, not calculated_start
+                    loss_limit = self.ftmo_monitor.initial_balance * safe_loss_pct
                     hard_deck = calculated_start - loss_limit
                     self.r.set("risk:hard_deck_level", hard_deck)
                     
@@ -1140,8 +1137,6 @@ class HybridProducer:
                         
                         self.last_prices[sym] = price_now
                         
-                        self.cluster_engine.update_correlations(pd.DataFrame())
-                        
                         # Preserve existing utc_ts calculation for historic bar alignment
                         utc_ts = int(tick.time_msc) - int(self.exec_engine.broker_time_offset * 1000)
                         
@@ -1243,12 +1238,17 @@ class HybridProducer:
 
         # Polling Loop
         empty_poll_counter = 0
+        last_trim_time = time.time()
+        
         while self.running:
             try:
                 if empty_poll_counter % 10 == 0:
                     log.info(f"💤 Polling Stream: {TRADE_REQUEST_STREAM}...")
 
-                if int(time.time()) % 60 == 0: self.r.xtrim(TRADE_REQUEST_STREAM, maxlen=1000, approximate=True)
+                now = time.time()
+                if now - last_trim_time > 60:
+                    self.r.xtrim(TRADE_REQUEST_STREAM, maxlen=1000, approximate=True)
+                    last_trim_time = now
                 
                 entries = self.r.xreadgroup("execution_group", "producer_main", {TRADE_REQUEST_STREAM: '>'}, count=5, block=1000)
                 
@@ -1633,7 +1633,8 @@ class HybridProducer:
                         with self.mt5_lock:
                             info = self.exec_engine._safe_account_info()
                             if info:
-                                start_equity = info.equity
+                                # 🚨 CRITICAL FIX: FTMO Rule requires max(Balance, Equity)
+                                start_equity = max(info.balance, info.equity)
                                 self.r.set(daily_start_key, start_equity)
                                 
                                 max_loss_pct = CONFIG.get('risk_management', {}).get('max_daily_loss_pct', 0.040)
@@ -1713,6 +1714,81 @@ class HybridProducer:
             except Exception as e: log.error(f"Pending Monitor Error: {e}")
             time.sleep(1)
 
+    def _trailing_stop_monitor(self):
+        """
+        V20.18 CRITICAL FIX: Live Trailing Stop & Breakeven Monitor.
+        Extracts original risk distance from Redis to preserve dynamic RR geometry.
+        """
+        log.info("Starting Live Trailing Stop & Breakeven Monitor...")
+        trail_conf = CONFIG.get('risk_management', {}).get('trailing_stop', {})
+        if not trail_conf.get('enabled', True):
+            return
+        
+        while self.running and not self.stop_event.is_set():
+            try:
+                with self.mt5_lock:
+                    positions = self.exec_engine._safe_positions_get()
+                    if positions:
+                        for pos in positions:
+                            if pos.magic != self.exec_engine.magic_number: continue
+                            
+                            # Extract Short ID to fetch original risk geometry
+                            short_id = None
+                            if "Auto_" in pos.comment:
+                                parts = pos.comment.split('_')
+                                if len(parts) >= 2: short_id = parts[1][:8]
+                            
+                            if not short_id: continue
+                            
+                            risk_dist_str = self.r.hget("bot:initial_risk", short_id)
+                            if not risk_dist_str: continue
+                            risk_dist = float(risk_dist_str)
+                            
+                            tick = mt5.symbol_info_tick(pos.symbol)
+                            if not tick: continue
+                            
+                            current_price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
+                            new_sl = None
+                            reason = ""
+                            
+                            # BE Lock (+0.25R) at 1.0R | Trail (0.5R lag) at 1.5R
+                            if pos.type == mt5.ORDER_TYPE_BUY:
+                                r_multiple = (current_price - pos.price_open) / risk_dist
+                                if r_multiple >= 1.5:
+                                    target_sl = pos.price_open + (risk_dist * 0.5)
+                                    if target_sl > pos.sl:
+                                        new_sl, reason = target_sl, f"Trail ({r_multiple:.1f}R)"
+                                elif r_multiple >= 1.0:
+                                    target_sl = pos.price_open + (risk_dist * 0.25)
+                                    if target_sl > pos.sl:
+                                        new_sl, reason = target_sl, "BE Lock (+0.25R)"
+                            else:
+                                r_multiple = (pos.price_open - current_price) / risk_dist
+                                if r_multiple >= 1.5:
+                                    target_sl = pos.price_open - (risk_dist * 0.5)
+                                    if target_sl < pos.sl or pos.sl == 0:
+                                        new_sl, reason = target_sl, f"Trail ({r_multiple:.1f}R)"
+                                elif r_multiple >= 1.0:
+                                    target_sl = pos.price_open - (risk_dist * 0.25)
+                                    if target_sl < pos.sl or pos.sl == 0:
+                                        new_sl, reason = target_sl, "BE Lock (+0.25R)"
+                            
+                            if new_sl is not None:
+                                request = {
+                                    "action": mt5.TRADE_ACTION_SLTP,
+                                    "symbol": pos.symbol,
+                                    "position": pos.ticket,
+                                    "sl": new_sl,
+                                    "tp": pos.tp,
+                                    "magic": pos.magic
+                                }
+                                res = self.exec_engine._safe_order_send(request)
+                                if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                                    log.info(f"🛡️ TRAILING STOP UPDATED: {pos.symbol} Ticket:{pos.ticket} -> {reason}")
+            except Exception as e:
+                log.error(f"Trailing Stop Monitor Error: {e}")
+            time.sleep(1)
+
     def run(self):
         threads = [
             threading.Thread(target=self._tick_stream_loop, daemon=True),
@@ -1722,7 +1798,8 @@ class HybridProducer:
             threading.Thread(target=self._midnight_watchman_loop, daemon=True),
             threading.Thread(target=self._pending_order_monitor, daemon=True),
             threading.Thread(target=self._closed_trade_monitor, daemon=True),
-            threading.Thread(target=self._maintain_time_sync, daemon=True) 
+            threading.Thread(target=self._maintain_time_sync, daemon=True),
+            threading.Thread(target=self._trailing_stop_monitor, daemon=True)
         ]
         for t in threads: t.start()
         log.info(f"{LogSymbols.ONLINE} Windows Producer Running. Risk State: {self.ftmo_monitor.starting_equity_of_day} | V20.18 Dual-Model Idempotency Active")
