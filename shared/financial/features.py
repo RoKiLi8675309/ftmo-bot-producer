@@ -8,7 +8,7 @@ import logging
 import math
 import os
 import threading
-import copy  # 🚨 CRITICAL FIX: Added missing import for model cloning
+import copy
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 from collections import deque
@@ -336,6 +336,10 @@ class AdaptiveImbalanceBarGenerator:
     def __init__(self, symbol: str, initial_threshold: float = 10.0, alpha: float = 0.05):
         self.symbol = symbol
         
+        # 🚨 V20.18 FIX: Store the dynamic minimum threshold derived from the calibration phase.
+        # This prevents the hardcap bug from destroying retail FX dense data streams.
+        self.min_threshold = max(0.1, initial_threshold * 0.1)
+        
         # State variables for the current bar
         self.current_imbalance = 0.0
         self.ticks_in_bar = 0
@@ -455,7 +459,10 @@ class AdaptiveImbalanceBarGenerator:
 
         current_abs_imb = abs(self.current_imbalance)
         self.expected_imbalance = (self.alpha * current_abs_imb) + ((1 - self.alpha) * self.expected_imbalance)
-        self.expected_imbalance = max(10.0, min(self.expected_imbalance, 10000.0))
+        
+        # 🚨 V20.18 FIX: Utilize self.min_threshold instead of a hardcoded 10.0!
+        # This completely cures the Data Starvation bug on retail fractional tick volume feeds.
+        self.expected_imbalance = max(self.min_threshold, min(self.expected_imbalance, 10000.0))
 
         self.current_imbalance = 0.0
         self.ticks_in_bar = 0
@@ -523,8 +530,6 @@ class FractalDimensionIndex:
 class RegimeDetector:
     """
     Online Hidden Markov Model (HMM) for regime classification.
-    V20.18 FIX: Asynchronous fitting prevents the Python GIL from blocking
-    the live tick stream. Accepts a shared ThreadPoolExecutor to prevent thread explosion.
     """
     def __init__(self, n_states: int = 2, window: int = 100, executor: Optional[ThreadPoolExecutor] = None):
         self.n_states = n_states
@@ -539,9 +544,9 @@ class RegimeDetector:
         # Concurrency protections
         self.lock = threading.Lock()
         
-        # 🚨 CRITICAL FIX: Share the global thread pool
-        self._owns_executor = executor is None
-        self.executor = executor if executor else ThreadPoolExecutor(max_workers=1)
+        # 🚨 V20.18 FIX: Track whether we own the executor or if it was injected
+        self._owns_executor = False
+        self.executor = executor
         self.is_fitting = False
         
         if HMM_AVAILABLE:
@@ -572,9 +577,8 @@ class RegimeDetector:
     def __setstate__(self, state):
         self.__dict__.update(state)
         self.lock = threading.Lock()
-        # Create a fallback executor if unpickled; OnlineFeatureEngineer will re-inject the global one.
-        self.executor = ThreadPoolExecutor(max_workers=1)
-        self._owns_executor = True
+        self.executor = None
+        self._owns_executor = False
         self.is_fitting = False
     
     def update(self, ret: float) -> int:
@@ -598,7 +602,14 @@ class RegimeDetector:
             if should_fit and not self.is_fitting:
                 self.is_fitting = True
                 fit_data = data.copy()
-                self.executor.submit(self._async_fit, fit_data)
+                
+                # 🚨 V20.18 FIX: Synchronous Execution during Backtests!
+                # If no executor is provided, we MUST run synchronously to prevent cross-trial
+                # state contamination and assure pure determinism during Optuna search.
+                if self.executor is not None:
+                    self.executor.submit(self._async_fit, fit_data)
+                else:
+                    self._async_fit(fit_data)
             
             with self.lock:
                 if hasattr(self.model, 'startprob_'):
@@ -1320,15 +1331,10 @@ def enrich_with_d1_data(features: Dict[str, float], d1_data: Dict[str, float], c
 class OnlineFeatureEngineer:
     """
     Orchestrates all streaming indicators and quantitative models to build a cohesive feature vector.
-    V20.18 FIX: Implements a unified ThreadPoolExecutor to prevent RegimeDetector from causing GIL lockups.
+    🚨 CRITICAL FIX: The ThreadPoolExecutor is now instantiated dynamically strictly based on `live_mode` 
+    to prevent Optuna background thread contamination across independent Swarm Trials.
     """
-    # 🚨 CRITICAL FIX: Share a single executor bounded by physical CPU limits to stop thread explosion
-    _shared_executor = ThreadPoolExecutor(
-        max_workers=max(1, (os.cpu_count() or 4) - 2), 
-        thread_name_prefix="RegimeHMM"
-    )
-
-    def __init__(self, window_size: int = 50):
+    def __init__(self, window_size: int = 50, live_mode: bool = False):
         self.window_size = window_size
         
         # Core monitors
@@ -1338,8 +1344,9 @@ class OnlineFeatureEngineer:
         entropy_win = CONFIG.get('features', {}).get('entropy_window', 100)
         self.entropy_monitor = EntropyMonitor(window=entropy_win)
         
-        # 🚨 CRITICAL FIX: Inject global executor to prevent thread explosion (GIL lockup fix)
-        self.regime_detector = RegimeDetector(n_states=2, window=100, executor=self._shared_executor)
+        # 🚨 CRITICAL FIX: Isolate HMM fitting. Use ThreadPoolExecutor ONLY in Live mode.
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="RegimeHMM") if live_mode else None
+        self.regime_detector = RegimeDetector(n_states=2, window=100, executor=self.executor)
         
         # Streaming features
         self.bb = StreamingBollingerBands(window=20)
@@ -1399,7 +1406,7 @@ class OnlineFeatureEngineer:
         
     def __setstate__(self, state):
         self.__dict__.update(state)
-        # Re-inject the shared executor upon unpickling to ensure stability across worker reboots
+        # Ensure safe unpickling without carrying over thread pool context
         if hasattr(self, 'regime_detector'):
-            self.regime_detector.executor = self._shared_executor
+            self.regime_detector.executor = None
             self.regime_detector._owns_executor = False

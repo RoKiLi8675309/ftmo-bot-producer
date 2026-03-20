@@ -1751,27 +1751,27 @@ class HybridProducer:
                             new_sl = None
                             reason = ""
                             
-                            # BE Lock (+0.25R) at 1.0R | Trail (0.5R lag) at 1.5R
+                            # Activate BE lock earlier at 0.75R instead of 1.0R
                             if pos.type == mt5.ORDER_TYPE_BUY:
                                 r_multiple = (current_price - pos.price_open) / risk_dist
                                 if r_multiple >= 1.5:
                                     target_sl = pos.price_open + (risk_dist * 0.5)
                                     if target_sl > pos.sl:
                                         new_sl, reason = target_sl, f"Trail ({r_multiple:.1f}R)"
-                                elif r_multiple >= 1.0:
-                                    target_sl = pos.price_open + (risk_dist * 0.25)
+                                elif r_multiple >= 0.75:
+                                    target_sl = pos.price_open + (risk_dist * 0.10) # Secure spread + tiny profit
                                     if target_sl > pos.sl:
-                                        new_sl, reason = target_sl, "BE Lock (+0.25R)"
+                                        new_sl, reason = target_sl, "BE Lock (+0.10R)"
                             else:
                                 r_multiple = (pos.price_open - current_price) / risk_dist
                                 if r_multiple >= 1.5:
                                     target_sl = pos.price_open - (risk_dist * 0.5)
                                     if target_sl < pos.sl or pos.sl == 0:
                                         new_sl, reason = target_sl, f"Trail ({r_multiple:.1f}R)"
-                                elif r_multiple >= 1.0:
-                                    target_sl = pos.price_open - (risk_dist * 0.25)
+                                elif r_multiple >= 0.75:
+                                    target_sl = pos.price_open - (risk_dist * 0.10) # Secure spread + tiny profit
                                     if target_sl < pos.sl or pos.sl == 0:
-                                        new_sl, reason = target_sl, "BE Lock (+0.25R)"
+                                        new_sl, reason = target_sl, "BE Lock (+0.10R)"
                             
                             if new_sl is not None:
                                 request = {
