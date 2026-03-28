@@ -12,7 +12,7 @@ from typing import Dict, Any, List, Optional, Set, Tuple
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 # --- PATH SAFETY FIX ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -793,7 +793,9 @@ class HybridProducer:
         self.d1_cache = {p: {} for p in SYMBOLS}
         self.h4_cache = {p: {} for p in SYMBOLS}
         self.last_context_update = 0
-        self.notified_tickets = set()
+        
+        # CRITICAL FIX: Replace set() with OrderedDict to preserve insertion order for purging
+        self.notified_tickets = OrderedDict()
         
         self.last_tick_state = defaultdict(lambda: {'time_msc': 0, 'volume_real': 0.0})
         self.last_prices = {s: 0.0 for s in SYMBOLS}
@@ -1693,9 +1695,11 @@ class HybridProducer:
     def _pending_order_monitor(self):
         while self.running:
             try:
+                # CRITICAL FIX: Ordered purging to retain true recent tickets
                 if len(self.notified_tickets) > 5000:
-                    recent = list(self.notified_tickets)[-1000:]
-                    self.notified_tickets = set(recent)
+                    while len(self.notified_tickets) > 1000:
+                        self.notified_tickets.popitem(last=False) # Pops oldest
+
                 with self.mt5_lock:
                     orders = self.exec_engine._safe_orders_get()
                     if orders:
@@ -1706,7 +1710,8 @@ class HybridProducer:
                                         self.r.publish("order_filled_channel", json.dumps({
                                             'ticket': order.ticket, 'symbol': order.symbol, 'type': 'FILLED'
                                         }))
-                                        self.notified_tickets.add(order.ticket)
+                                        # Store with a dummy value
+                                        self.notified_tickets[order.ticket] = True
                                 if time.time() - order.time_setup > 60:
                                     log.info(f"Cancelling Zombie Order {order.ticket} (Pending > 60s)")
                                     req = {"action": mt5.TRADE_ACTION_REMOVE, "order": order.ticket}

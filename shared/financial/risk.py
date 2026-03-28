@@ -175,10 +175,15 @@ class RiskManager:
         # --- V20.18 FIX: FRIDAY LEVERAGE CLAMP (FTMO MARGIN STARVATION PREVENTION) ---
         env_mode = CONFIG.get('env', {}).get('mode', 'LIVE').upper()
         
-        # Only apply real-time clock checks if we are actually running the LIVE engine.
-        # This prevents the backtester from continuously triggering Friday restrictions 
-        # on historical data if you happen to run the optimization on a real-world Friday.
-        if env_mode == 'LIVE':
+        # CRITICAL FIX: Detect if we are in a backtest environment to prevent datetime.now() 
+        # from permanently clamping historical WFO sizing if run on a real-world Friday.
+        import sys
+        is_backtest = False
+        if sys.argv and len(sys.argv) > 0:
+            is_backtest = 'main_research.py' in sys.argv[0] or 'backtester' in sys.modules
+
+        # Only apply real-time clock checks if we are actually running the LIVE engine AND NOT IN WFO.
+        if env_mode == 'LIVE' and not is_backtest:
             guard = SessionGuard()
             if guard.is_friday_afternoon():
                 # FTMO dynamically slashes leverage over the weekend (e.g., 1:30 -> 1:10).

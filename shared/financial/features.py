@@ -412,10 +412,10 @@ class AdaptiveImbalanceBarGenerator:
         if abs(self.current_imbalance) >= self.expected_imbalance or self.ticks_in_bar >= 1000:
             # ⚠️ WARNING FIX: Calculate volume spillover to prevent data distortion
             excess_imbalance = abs(self.current_imbalance) - self.expected_imbalance
-            spill_vol = 0.0
-            if abs(self.current_imbalance) > 0:
-                spill_ratio = excess_imbalance / abs(self.current_imbalance)
-                spill_vol = volume * spill_ratio
+            
+            # CRITICAL FIX: The absolute addition to imbalance from this tick is exactly its volume.
+            # Therefore, the portion of volume belonging to the next bar is strictly the excess imbalance.
+            spill_vol = min(volume, excess_imbalance) if excess_imbalance > 0 else 0.0
 
             bar = self._finalize_bar(timestamp, price)
             
