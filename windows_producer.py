@@ -1751,27 +1751,29 @@ class HybridProducer:
                             new_sl = None
                             reason = ""
                             
-                            # Activate BE lock earlier at 0.75R instead of 1.0R
+                            # Activate BE lock later at 1.20R instead of 0.75R
                             if pos.type == mt5.ORDER_TYPE_BUY:
                                 r_multiple = (current_price - pos.price_open) / risk_dist
                                 if r_multiple >= 1.5:
                                     target_sl = pos.price_open + (risk_dist * 0.5)
                                     if target_sl > pos.sl:
                                         new_sl, reason = target_sl, f"Trail ({r_multiple:.1f}R)"
-                                elif r_multiple >= 0.75:
-                                    target_sl = pos.price_open + (risk_dist * 0.10) # Secure spread + tiny profit
+                                # 🚨 NEW: Wait until 1.20R to lock Break Even
+                                elif r_multiple >= 1.20:
+                                    target_sl = pos.price_open + (risk_dist * 0.15) # Secure spread + 0.15R
                                     if target_sl > pos.sl:
-                                        new_sl, reason = target_sl, "BE Lock (+0.10R)"
+                                        new_sl, reason = target_sl, "BE Lock (+0.15R)"
                             else:
                                 r_multiple = (pos.price_open - current_price) / risk_dist
                                 if r_multiple >= 1.5:
                                     target_sl = pos.price_open - (risk_dist * 0.5)
                                     if target_sl < pos.sl or pos.sl == 0:
                                         new_sl, reason = target_sl, f"Trail ({r_multiple:.1f}R)"
-                                elif r_multiple >= 0.75:
-                                    target_sl = pos.price_open - (risk_dist * 0.10) # Secure spread + tiny profit
+                                # 🚨 NEW: Wait until 1.20R to lock Break Even
+                                elif r_multiple >= 1.20:
+                                    target_sl = pos.price_open - (risk_dist * 0.15) # Secure spread + 0.15R
                                     if target_sl < pos.sl or pos.sl == 0:
-                                        new_sl, reason = target_sl, "BE Lock (+0.10R)"
+                                        new_sl, reason = target_sl, "BE Lock (+0.15R)"
                             
                             if new_sl is not None:
                                 request = {

@@ -173,14 +173,21 @@ class RiskManager:
             lev = float(lev_map.get('indices', 20.0))
 
         # --- V20.18 FIX: FRIDAY LEVERAGE CLAMP (FTMO MARGIN STARVATION PREVENTION) ---
-        guard = SessionGuard()
-        if guard.is_friday_afternoon():
-            # FTMO dynamically slashes leverage over the weekend (e.g., 1:30 -> 1:10).
-            # By proactively dividing our perceived leverage by 3.0 heading into Friday, 
-            # we tightly clamp the free margin, preventing margin calls during the weekend squeeze.
-            original_lev = lev
-            lev = max(1.0, lev / 3.0)
-            logger.info(f"🛡️ WEEKEND MARGIN CLAMP: {symbol} Margin Requirements Adjusted (Effective Lev: {lev:.1f}x) to survive Friday Rollover.")
+        env_mode = CONFIG.get('env', {}).get('mode', 'LIVE').upper()
+        
+        # Only apply real-time clock checks if we are actually running the LIVE engine.
+        # This prevents the backtester from continuously triggering Friday restrictions 
+        # on historical data if you happen to run the optimization on a real-world Friday.
+        if env_mode == 'LIVE':
+            guard = SessionGuard()
+            if guard.is_friday_afternoon():
+                # FTMO dynamically slashes leverage over the weekend (e.g., 1:30 -> 1:10).
+                # By proactively dividing our perceived leverage by 3.0 heading into Friday, 
+                # we tightly clamp the free margin, preventing margin calls during the weekend squeeze.
+                original_lev = lev
+                lev = max(1.0, lev / 3.0)
+                # DOWNGRAED TO DEBUG TO PREVENT CONSOLE SPAM
+                logger.debug(f"🛡️ WEEKEND MARGIN CLAMP: {symbol} Margin Requirements Adjusted (Effective Lev: {lev:.1f}x) to survive Friday Rollover.")
 
         if lev <= 0: return 0.0
 
@@ -473,13 +480,16 @@ class SessionGuard:
             
         ny_dt = utc_dt.astimezone(self.ny_tz)
         
-        # 2. FRIDAY HARD CLOSE (NY TIME)
-        if ny_dt.weekday() == 4:
+        # 2. FRIDAY HARD CLOSE & WEEKENDS (NY TIME)
+        if ny_dt.weekday() == 4: # Friday
             # 14:00 NY is strictly 3 hours before 17:00 NY Close
             if ny_dt.hour >= 14:
                 return True
-        elif ny_dt.weekday() > 4: 
-            return True # Weekend
+        elif ny_dt.weekday() == 5: 
+            return True # Saturday (Market Closed)
+        elif ny_dt.weekday() == 6:
+            if ny_dt.hour < 17: 
+                return True # Sunday before 17:00 NY (Market opens at 17:00 NY)
             
         # 3. DAILY SESSION CLOSE (SERVER TIME)
         # Use provided timestamp aligned to Market TZ

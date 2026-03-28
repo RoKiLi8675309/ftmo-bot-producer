@@ -279,9 +279,11 @@ def load_real_data(
                 df = pd.read_sql(query_ticks, conn, params=params)
         
         except Exception:
-            # Fallback to OHLCV
+            # 🚨 V20.18 FIX: OHLCV WICK PRESERVATION
+            # Crucially fetches open, high, low, close from the database so the
+            # labeler can accurately detect intra-bar stop loss hits!
             query_ohlcv = text("""
-                SELECT time, close as price, close as bid, close as ask, volume 
+                SELECT time, close as price, close as bid, close as ask, open, high, low, close, volume 
                 FROM ohlcv 
                 WHERE symbol = :symbol 
                 AND time > NOW() - INTERVAL :days 

@@ -336,9 +336,9 @@ class AdaptiveImbalanceBarGenerator:
     def __init__(self, symbol: str, initial_threshold: float = 10.0, alpha: float = 0.05):
         self.symbol = symbol
         
-        # 🚨 V20.18 FIX: Store the dynamic minimum threshold derived from the calibration phase.
-        # This prevents the hardcap bug from destroying retail FX dense data streams.
-        self.min_threshold = max(0.1, initial_threshold * 0.1)
+        # 🚨 NEW: Raise the absolute floor to prevent micro-bars. 
+        # For standard FX lots, 10.0 to 15.0 is a safe minimum to overcome spread.
+        self.min_threshold = max(15.0, initial_threshold * 0.5) 
         
         # State variables for the current bar
         self.current_imbalance = 0.0
@@ -460,9 +460,8 @@ class AdaptiveImbalanceBarGenerator:
         current_abs_imb = abs(self.current_imbalance)
         self.expected_imbalance = (self.alpha * current_abs_imb) + ((1 - self.alpha) * self.expected_imbalance)
         
-        # 🚨 V20.18 FIX: Utilize self.min_threshold instead of a hardcoded 10.0!
-        # This completely cures the Data Starvation bug on retail fractional tick volume feeds.
-        self.expected_imbalance = max(self.min_threshold, min(self.expected_imbalance, 10000.0))
+        # 🚨 NEW: Enforce the stricter floor to guarantee actionable volatility
+        self.expected_imbalance = max(self.min_threshold, min(self.expected_imbalance, 5000.0))
 
         self.current_imbalance = 0.0
         self.ticks_in_bar = 0
