@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import logging
 import math
 import time
@@ -221,7 +222,8 @@ class RiskManager:
         daily_pnl_pct: float = 0.0,
         current_open_risk_pct: float = 0.0,
         free_margin: float = 999999.0,
-        parkinson_vol: float = 0.0  
+        parkinson_vol: float = 0.0,
+        sl_atr_mult_override: Optional[float] = None
     ) -> Tuple[Trade, float]:
         """
         V20.9 UPDATE: Strict Geometric Synchronization.
@@ -243,7 +245,10 @@ class RiskManager:
             c_size = RiskManager.get_contract_size(symbol)
         
         # 2. Stop Loss Geometry (Parity with AdaptiveTripleBarrier)
-        atr_mult_sl = float(risk_conf.get('stop_loss_atr_mult', 1.5)) 
+        if sl_atr_mult_override is not None:
+            atr_mult_sl = sl_atr_mult_override
+        else:
+            atr_mult_sl = float(risk_conf.get('stop_loss_atr_mult', 1.5)) 
         
         # Pull dynamic reward multiplier directly from context if strategy modified it
         if hasattr(context, 'risk_reward_ratio') and context.risk_reward_ratio and context.risk_reward_ratio > 0:
@@ -564,6 +569,11 @@ class FTMORiskMonitor:
         return "OK"
 
 class HierarchicalRiskParity:
+    """
+    V20.18 MATH FIX: Correctly executes True Hierarchical Risk Parity 
+    utilizing Recursive Bisection based on the Quasi-Diagonalized Linkage Matrix.
+    Replaces the flawed Inverse Variance computation to restore true diversification.
+    """
     @staticmethod
     def get_allocation(returns_df: pd.DataFrame) -> Dict[str, float]:
         cols = returns_df.columns.tolist()
@@ -574,16 +584,20 @@ class HierarchicalRiskParity:
             # Guard against flatline zero-variance which causes NaN in correlation
             df_safe = returns_df.fillna(0.0)
             corr = df_safe.corr().fillna(0.0)
+            
+            # Step 1: Hierarchical Clustering
             dist = ssd.pdist(corr, metric='euclidean')
             link = sch.linkage(dist, method='single')
+            
+            # Step 2: Quasi-Diagonalization
             sort_ix = HierarchicalRiskParity._get_quasi_diag(link)
-            sort_ix = [cols[i] for i in sort_ix]
+            sort_ix_cols = [cols[i] for i in sort_ix]
+            
+            # Step 3: Recursive Bisection
             cov = df_safe.cov()
-            variances = np.diag(cov)
-            variances[variances < EPS] = EPS
-            inv_var = 1.0 / variances
-            weights = inv_var / np.sum(inv_var)
-            return dict(zip(cols, weights))
+            weights = HierarchicalRiskParity._get_rec_bipart(cov, sort_ix_cols)
+            
+            return weights.to_dict()
         except Exception as e:
             logger.error(f"HRP Failed: {e}")
             return {c: 1.0/len(cols) for c in cols}
@@ -604,6 +618,47 @@ class HierarchicalRiskParity:
             sort_ix = sort_ix.sort_index()
             sort_ix.index = range(sort_ix.shape[0])
         return sort_ix.tolist()
+
+    @staticmethod
+    def _get_ivp(cov: pd.DataFrame) -> np.ndarray:
+        """Calculates the Inverse Variance Portfolio given a covariance matrix slice."""
+        variances = np.diag(cov)
+        variances[variances < EPS] = EPS
+        ivp = 1.0 / variances
+        return ivp / np.sum(ivp)
+
+    @staticmethod
+    def _get_cluster_var(cov: pd.DataFrame, c_items: List[str]) -> float:
+        """Calculates the variance of a cluster based on the IVP weighting."""
+        cov_slice = cov.loc[c_items, c_items]
+        weights = HierarchicalRiskParity._get_ivp(cov_slice).reshape(-1, 1)
+        cvar = np.dot(np.dot(weights.T, cov_slice), weights)[0, 0]
+        return float(cvar)
+
+    @staticmethod
+    def _get_rec_bipart(cov: pd.DataFrame, sort_ix: List[str]) -> pd.Series:
+        """Recursively bisects the quasi-diagonalized matrix to allocate true HRP weights."""
+        weights = pd.Series(1.0, index=sort_ix)
+        c_items = [sort_ix]
+        
+        while len(c_items) > 0:
+            # Bisect existing clusters
+            c_items = [i[j:k] for i in c_items for j, k in ((0, len(i)//2), (len(i)//2, len(i))) if len(i) > 1]
+            
+            for i in range(0, len(c_items), 2):
+                c_items_0 = c_items[i]
+                c_items_1 = c_items[i+1]
+                
+                cvar0 = HierarchicalRiskParity._get_cluster_var(cov, c_items_0)
+                cvar1 = HierarchicalRiskParity._get_cluster_var(cov, c_items_1)
+                
+                # Allocate weight inversely proportional to the cluster's variance
+                alpha = 1.0 - cvar0 / (cvar0 + cvar1) if (cvar0 + cvar1) > 0 else 0.5
+                
+                weights[c_items_0] *= alpha
+                weights[c_items_1] *= (1.0 - alpha)
+                
+        return weights
 
 class PortfolioRiskManager:
     def __init__(self, symbols: List[str]):
