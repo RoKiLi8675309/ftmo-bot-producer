@@ -138,40 +138,64 @@ class MT5ExecutionEngine:
         """Checks connection with a timeout guard."""
         return mt5.terminal_info().connected
 
-    # --- V20.18 IPC ROBUSTNESS WRAPPERS ---
+    # --- V20.19 IPC AUTO-HEALING WRAPPERS ---
     def _safe_positions_get(self, symbol: Optional[str] = None, max_retries: int = 3) -> Optional[tuple]:
-        """Safely fetches positions with retry logic against MT5 IPC drops."""
+        """Safely fetches positions with EXPONENTIAL RETRY & AUTO-HEALING against MT5 IPC drops."""
         for attempt in range(max_retries):
             positions = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
             if positions is not None:
                 return positions
             err = mt5.last_error()
             log.warning(f"⚠️ mt5.positions_get() returned None. Error: {err}. Retry {attempt+1}/{max_retries}")
-            time.sleep(0.5)
+            
+            # 🚨 AUTO-HEALING PROTOCOL: Force restart dead socket
+            if err and err[0] in [-10001, -10004, -10005]:
+                log.critical(f"🔄 IPC SOCKET DEAD (Code {err[0]}). Force restarting MT5 connection in-thread...")
+                mt5.shutdown()
+                time.sleep(0.5)
+                mt5.initialize()
+
+            time.sleep(1.0 * (2 ** attempt)) # Exponential backoff to clear IPC buffer
         log.error(f"❌ CRITICAL: mt5.positions_get() failed after {max_retries} retries.")
         return None
 
     def _safe_orders_get(self, symbol: Optional[str] = None, max_retries: int = 3) -> Optional[tuple]:
-        """Safely fetches pending orders with retry logic against MT5 IPC drops."""
+        """Safely fetches pending orders with EXPONENTIAL RETRY & AUTO-HEALING against MT5 IPC drops."""
         for attempt in range(max_retries):
             orders = mt5.orders_get(symbol=symbol) if symbol else mt5.orders_get()
             if orders is not None:
                 return orders
             err = mt5.last_error()
             log.warning(f"⚠️ mt5.orders_get() returned None. Error: {err}. Retry {attempt+1}/{max_retries}")
-            time.sleep(0.5)
+            
+            # 🚨 AUTO-HEALING PROTOCOL
+            if err and err[0] in [-10001, -10004, -10005]:
+                log.critical(f"🔄 IPC SOCKET DEAD (Code {err[0]}). Force restarting MT5 connection in-thread...")
+                mt5.shutdown()
+                time.sleep(0.5)
+                mt5.initialize()
+
+            time.sleep(1.0 * (2 ** attempt)) # Exponential backoff
         log.error(f"❌ CRITICAL: mt5.orders_get() failed after {max_retries} retries.")
         return None
 
     def _safe_account_info(self, max_retries: int = 3) -> Optional[Any]:
-        """Safely fetches account info with retry logic against MT5 IPC drops."""
+        """Safely fetches account info with EXPONENTIAL RETRY & AUTO-HEALING against MT5 IPC drops."""
         for attempt in range(max_retries):
             info = mt5.account_info()
             if info is not None:
                 return info
             err = mt5.last_error()
             log.warning(f"⚠️ mt5.account_info() returned None. Error: {err}. Retry {attempt+1}/{max_retries}")
-            time.sleep(0.5)
+            
+            # 🚨 AUTO-HEALING PROTOCOL
+            if err and err[0] in [-10001, -10004, -10005]:
+                log.critical(f"🔄 IPC SOCKET DEAD (Code {err[0]}). Force restarting MT5 connection in-thread...")
+                mt5.shutdown()
+                time.sleep(0.5)
+                mt5.initialize()
+
+            time.sleep(1.0 * (2 ** attempt)) # Exponential backoff
         log.error(f"❌ CRITICAL: mt5.account_info() failed after {max_retries} retries.")
         return None
 
@@ -542,7 +566,7 @@ class MT5ExecutionEngine:
 
             # DYNAMIC VOLUME PRECISION
             if "volume" in request:
-                raw_vol = float(request.get("volume", 0.01))
+                raw_vol = request["volume"]  # Typecast previously secured in caller/below
                 
                 vol_step = symbol_info.volume_step
                 if vol_step > 0:
@@ -617,11 +641,19 @@ class MT5ExecutionEngine:
                     err = mt5.last_error()
                     log.warning(f"MT5 Order Send returned None. LAST ERROR: {err}. Checking idempotency...")
                     
-                    log.warning("🔄 FORCING MT5 RECONNECT...")
-                    with self.lock:
-                        mt5.shutdown()
-                        time.sleep(0.5)
-                        mt5.initialize()
+                    # 🚨 AUTO-HEALING PROTOCOL
+                    if err and err[0] in [-10001, -10004, -10005]:
+                        log.critical(f"🔄 IPC SOCKET DEAD (Code {err[0]}). Force restarting MT5 connection in-thread...")
+                        with self.lock:
+                            mt5.shutdown()
+                            time.sleep(0.5)
+                            mt5.initialize()
+                    else:
+                        log.warning("🔄 FORCING MT5 RECONNECT...")
+                        with self.lock:
+                            mt5.shutdown()
+                            time.sleep(0.5)
+                            mt5.initialize()
                     
                     if signal_uuid:
                         ghost = self._check_idempotency(raw_symbol, signal_uuid)
@@ -1429,7 +1461,7 @@ class HybridProducer:
                         self.r.xack(TRADE_REQUEST_STREAM, "execution_group", msg_id)
                         return
 
-                    log_type = "BUY" if order_type == mt5.ORDER_TYPE_BUY else "SELL"
+                log_type = "BUY" if order_type == mt5.ORDER_TYPE_BUY else "SELL"
 
                 log.info(f"⚡ EXECUTING {log_type} {symbol} | Vol: {data['volume']} | Price: {price} | ActionCode: {order_action}")
                 
@@ -1540,30 +1572,13 @@ class HybridProducer:
                     if positions is None:
                         positions = []
                     
-                    if info:
-                        self.r.hset(CONFIG['redis']['account_info_key'], mapping={
-                            "balance": info.balance, "equity": info.equity,
-                            "margin": info.margin, 
-                            "free_margin": info.margin_free,
-                            "updated": time.time()
-                        })
-                        self.r.set(CONFIG['redis']['risk_keys']['current_equity'], info.equity)
-                    if self.ftmo_monitor:
-                        self.ftmo_monitor.equity = info.equity if info else self.ftmo_monitor.equity
-                        if not self.ftmo_monitor.can_trade():
-                            log.critical("RISK BREACH DETECTED IN SYNC LOOP. ATTEMPTING LIQUIDATION.")
-                            self._close_all_positions()
-                    try:
-                        hard_deck = float(self.r.get("risk:hard_deck_level") or 0.0)
-                        if info and hard_deck > 0 and info.equity < hard_deck:
-                            log.critical(f"💀 HARD DECK BREACHED: Equity {info.equity} < {hard_deck}. LIQUIDATING ALL.")
-                            self._close_all_positions()
-                    except Exception as e: log.error(f"Hard Deck Check Failed: {e}")
-                    
+                    bot_positions = []
                     pos_list = []
+                    
                     if positions:
                         for p in positions:
                             if p.magic == MAGIC_NUMBER:
+                                bot_positions.append(p)
                                 utc_entry_time = p.time - self.exec_engine.broker_time_offset
                                 
                                 pos_list.append({
@@ -1573,10 +1588,42 @@ class HybridProducer:
                                     "profit": p.profit, "sl": p.sl, "tp": p.tp,
                                     "time": float(utc_entry_time), "magic": p.magic, "comment": p.comment 
                                 })
+                    
+                    if info:
+                        self.r.hset(CONFIG['redis']['account_info_key'], mapping={
+                            "balance": info.balance, "equity": info.equity,
+                            "margin": info.margin, 
+                            "free_margin": info.margin_free,
+                            "updated": time.time()
+                        })
+                        self.r.set(CONFIG['redis']['risk_keys']['current_equity'], info.equity)
+                    
+                    if self.ftmo_monitor:
+                        self.ftmo_monitor.equity = info.equity if info else self.ftmo_monitor.equity
+                        if not self.ftmo_monitor.can_trade():
+                            if len(bot_positions) > 0:
+                                log.critical("RISK BREACH DETECTED IN SYNC LOOP. ATTEMPTING LIQUIDATION.")
+                                self._close_all_positions()
+                                # 🚨 V20.21 FIX: Kill Switch Activation
+                                with open(KILL_SWITCH_FILE, "w") as f: f.write("RISK_BREACH")
+                    try:
+                        hard_deck = float(self.r.get("risk:hard_deck_level") or 0.0)
+                        if info and hard_deck > 0 and info.equity < hard_deck:
+                            if len(bot_positions) > 0:
+                                log.critical(f"💀 HARD DECK BREACHED: Equity {info.equity} < {hard_deck}. LIQUIDATING ALL.")
+                                self._close_all_positions()
+                            else:
+                                log.critical(f"💀 HARD DECK BREACHED: Equity {info.equity} < {hard_deck}. Bot is flat. SHUTTING DOWN.")
+                                
+                            # 🚨 V20.21 FIX: Kill Switch Activation (Stops the infinite loop)
+                            with open(KILL_SWITCH_FILE, "w") as f: f.write("HARD_DECK")
+                            time.sleep(1) # Allow log to flush
+                    except Exception as e: log.error(f"Hard Deck Check Failed: {e}")
+                    
                     key = f"{CONFIG['redis']['position_state_key_prefix']}:{MAGIC_NUMBER}"
                     self.r.set(key, json.dumps(pos_list))
             except: pass
-            time.sleep(1)
+            time.sleep(3) # V20.19 FIX: Increased from 1s to 3s to reduce IPC load
 
     def _validate_risk_synchronous(self, symbol: str) -> bool:
         try:
@@ -1712,12 +1759,14 @@ class HybridProducer:
                                         }))
                                         # Store with a dummy value
                                         self.notified_tickets[order.ticket] = True
-                                if time.time() - order.time_setup > 60:
+                                # --- FIXED ZOMBIE TIME SYNC ---
+                                server_time_now = time.time() + self.exec_engine.broker_time_offset
+                                if server_time_now - order.time_setup > 60:
                                     log.info(f"Cancelling Zombie Order {order.ticket} (Pending > 60s)")
                                     req = {"action": mt5.TRADE_ACTION_REMOVE, "order": order.ticket}
                                     mt5.order_send(req)
             except Exception as e: log.error(f"Pending Monitor Error: {e}")
-            time.sleep(1)
+            time.sleep(3) # V20.19 FIX: Increased from 1s to 3s to reduce IPC load
 
     def _trailing_stop_monitor(self):
         """
@@ -1794,7 +1843,7 @@ class HybridProducer:
                                     log.info(f"🛡️ TRAILING STOP UPDATED: {pos.symbol} Ticket:{pos.ticket} -> {reason}")
             except Exception as e:
                 log.error(f"Trailing Stop Monitor Error: {e}")
-            time.sleep(1)
+            time.sleep(2) # V20.19 FIX: Increased from 1s to 2s to reduce IPC load
 
     def run(self):
         threads = [

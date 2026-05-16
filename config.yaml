@@ -7,7 +7,7 @@
 # 2. EDGE TUNING: Added model_edge_threshold to Optuna to tune strictness.
 # 3. WFO BALANCE: min_trades_optimization set to 20 for statistical balance.
 # 4. SPREAD TRAP CURE: Minimum stop loss floor maintained at 20.0 pips.
-# 5. CHALLENGE PACING: Risk increased to 1.5% base to hit $5,000 target.
+# 5. CHALLENGE PACING: Risk increased to 0.75% base to hit $5,000 target safely.
 # =============================================================================
 
 # --- 🌍 ENVIRONMENT SPECIFIC ---
@@ -136,7 +136,8 @@ phoenix_strategy:
   
   asset_regime_map:
     GBPJPY: "TREND_BREAKOUT" 
-    USDJPY: "TREND_BREAKOUT"
+    # 🚨 QUANT FIX: USDJPY is chopping. Force it to trade mean reversion (tighter targets)
+    USDJPY: "MEAN_REVERSION" 
     EURJPY: "TREND_BREAKOUT"
     AUDJPY: "TREND_BREAKOUT"
     GBPUSD: "TREND_BREAKOUT"
@@ -148,7 +149,7 @@ phoenix_strategy:
   require_d1_trend: false  
   require_h4_alignment: false                 
   
-  hurst_breakout_threshold: 0.52      
+  hurst_breakout_threshold: 0.52     
   hurst_mean_reversion_threshold: 0.45    
   ker_trend_threshold: 0.0003         
   
@@ -191,9 +192,9 @@ optimization_search_space:
     max: 0.95
     
   meta_labeling_threshold:
-    min: 0.30
+    min: 0.35  # 🚨 QUANT FIX: Raised the floor from 0.30 to 0.35 to enforce stricter secondary veto
     max: 0.60
-    
+  
   model_edge_threshold: 
     min: 0.01
     max: 0.05
@@ -218,10 +219,10 @@ risk_management:
   sizing_method: "risk_percentage" 
   fixed_lot_size: 0.01        
   
-  # 🚨 NEW: Increased from 0.0100 (1%) to 0.0150 (1.5%) to accelerate challenge passing.
-  base_risk_per_trade_percent: 0.0150  
-  # 🚨 NEW: Increased from 0.0150 (1.5%) to 0.0200 (2.0%) to compound faster when in profit buffer.
-  scaled_risk_percent: 0.0200          
+  # 🚨 QUANT FIX: Optimal base risk to accelerate PnL velocity toward 10% target.
+  base_risk_per_trade_percent: 0.0075  
+  # 🚨 QUANT FIX: Scaled risk when safely inside profit buffer
+  scaled_risk_percent: 0.0100          
   
   loss_cooldown_minutes: 15  # Base 15m. Exponential multiplier will scale this up dynamically on losses.
   min_margin_level_percent: 200.0
@@ -234,7 +235,7 @@ risk_management:
   
   equity_ratchet:
     enabled: true
-    step_percent: 0.05    
+    step_percent: 0.05   
   
   max_currency_exposure: 4        
   max_open_trades: 100            
@@ -258,8 +259,8 @@ risk_management:
   
   trailing_stop:
     enabled: true        
-    # 🚨 NEW: Delay BE Lock until 1.20R to stop premature chop-outs and give breakout trades room to retest
-    activation_r: 1.20        
+    # 🚨 QUANT FIX: Delay BE lock to 1.50R. Gives trades breathing room to retest breakout zones without getting chopped.
+    activation_r: 1.50   
     trail_trigger_r: 2.0     
     trail_dist_r: 1.0        
   
@@ -317,7 +318,7 @@ online_learning:
   max_features: 'sqrt'    
   metric: "LogLoss"        
   
-  burn_in_periods: 20    
+  burn_in_periods: 20   
   
   volatility_gate:
     enabled: true

@@ -5,10 +5,11 @@
 # DEPENDENCIES: pandas, numpy, math
 # DESCRIPTION: Transforms raw data into ML-ready features (Cyclical Time, Clusters).
 #
-# FORENSIC REMEDIATION LOG (2025-12-23):
+# FORENSIC REMEDIATION LOG:
 # 1. CLUSTER CONTEXT: Enhanced Builder to track Correlation Matrices.
 # 2. FEATURE ENRICHMENT: Added 'global_correlation' to context vector.
-# 3. ROBUSTNESS: Added safety checks for missing correlation data.
+# 3. ROBUSTNESS (V20.19 FIX): Added explicit `.fillna(0.0)` to correlation summations 
+#    to prevent `NaN` collapse from zero-variance flatlines during weekends.
 # =============================================================================
 import numpy as np
 import pandas as pd
@@ -89,8 +90,7 @@ class ClusterContextBuilder:
     Analyzes asset groups to inject 'Regime Context' into the feature set.
     Example: If all USD pairs are moving up, we are in a 'USD Strong' regime.
       
-    UPDATED (2025-12-23): Now tracks Inter-Symbol Correlations to detect
-    market-wide stress or idiosyncratic moves.
+    Tracks Inter-Symbol Correlations to detect market-wide stress or idiosyncratic moves.
     """
     def __init__(self, symbols: List[str]):
         self.symbols = symbols
@@ -117,15 +117,19 @@ class ClusterContextBuilder:
         if corr_matrix.empty: return
         
         try:
+            # 🚨 V20.19 FIX: Fill NaN with 0.0 before summing to prevent feature collapse
+            # during flatlines (e.g., weekends, holidays) which yield zero variance and NaN correlations.
+            safe_corr = corr_matrix.fillna(0.0)
+
             # Calculate mean correlation per symbol (excluding self-correlation of 1.0)
             # We subtract 1 and divide by N-1 to get avg of off-diagonals
-            n = len(corr_matrix.columns)
+            n = len(safe_corr.columns)
             if n > 1:
-                sums = corr_matrix.sum(axis=1) - 1.0
+                sums = safe_corr.sum(axis=1) - 1.0
                 avgs = sums / (n - 1)
-                self.correlation_map = avgs.to_dict()
+                self.correlation_map = avgs.fillna(0.0).to_dict()
             else:
-                self.correlation_map = {c: 0.0 for c in corr_matrix.columns}
+                self.correlation_map = {c: 0.0 for c in safe_corr.columns}
         except Exception:
             pass # Fail silently, retain old map
 

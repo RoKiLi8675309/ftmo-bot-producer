@@ -332,13 +332,14 @@ def load_real_data(
         logger.error(f"ERROR: Database load failed for {symbol}: {e}")
         return pd.DataFrame()
 
-def batch_generate_volume_bars(tick_df: pd.DataFrame, volume_threshold: float = 1000, alpha: Optional[float] = None) -> List[Dict[str, Any]]:
+def batch_generate_volume_bars(tick_df: pd.DataFrame, volume_threshold: float = 1000, alpha: Optional[float] = None, symbol: str = "UNKNOWN") -> List[Dict[str, Any]]:
     """
     Offline batch processor using AdaptiveImbalanceBarGenerator Logic.
     
     AUDIT FIX (2025-12-25): Removed hardcoded alpha=0.025. 
     Now defaults to CONFIG['data']['imbalance_alpha'] (0.05) to match Live Engine.
     Crucially, relies on the single source of truth AdaptiveImbalanceBarGenerator from shared.financial.features.
+    V20.18.4 FIX: Added symbol routing to respect dynamic Asset-Scaled Bar Floors.
     """
     bars = []
     
@@ -347,7 +348,7 @@ def batch_generate_volume_bars(tick_df: pd.DataFrame, volume_threshold: float = 
         alpha = CONFIG['data'].get('imbalance_alpha', 0.05)
 
     # Use the unified generator for batch processing to ensure training data matches live data perfectly
-    gen = AdaptiveImbalanceBarGenerator(symbol="BATCH", initial_threshold=volume_threshold, alpha=alpha)
+    gen = AdaptiveImbalanceBarGenerator(symbol=symbol, initial_threshold=volume_threshold, alpha=alpha)
     
     for row in tick_df.itertuples():
         price = getattr(row, 'price', getattr(row, 'close', None))

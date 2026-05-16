@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import warnings
 import pandas as pd
 import numpy as np
@@ -336,9 +337,19 @@ class AdaptiveImbalanceBarGenerator:
     def __init__(self, symbol: str, initial_threshold: float = 10.0, alpha: float = 0.05):
         self.symbol = symbol
         
-        # 🚨 NEW: Raise the absolute floor to prevent micro-bars. 
-        # For standard FX lots, 10.0 to 15.0 is a safe minimum to overcome spread.
-        self.min_threshold = max(15.0, initial_threshold * 0.5) 
+        # 🚨 V20.18.4 FIX: Dynamic Asset-Scaled Bar Floors
+        # Prevents data starvation for Indices/Crypto which trade in smaller lot increments
+        s = symbol.upper()
+        if "BTC" in s or "ETH" in s or "LTC" in s or "XRP" in s:
+            base_floor = 0.5
+        elif any(idx in s for idx in ["US30", "GER30", "GER40", "NAS100", "SPX500", "US500", "DJI", "DAX", "UK100", "JP225"]):
+            base_floor = 2.0
+        elif "XAU" in s or "XAG" in s:
+            base_floor = 5.0
+        else:
+            base_floor = 15.0  # Standard FX
+            
+        self.min_threshold = max(base_floor, initial_threshold * 0.5) 
         
         # State variables for the current bar
         self.current_imbalance = 0.0

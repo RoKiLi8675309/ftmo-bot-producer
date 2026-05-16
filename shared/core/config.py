@@ -7,10 +7,9 @@
 # Supports path resolution for both Monolithic and Modular layouts.
 # CRITICAL: Python 3.9 Compatible (No '|' unions).
 #
-# UPDATES (V17.4 - Loky Conda Sync Fix):
-# 1. ENVIRONMENT LOCK: Enforced LOKY_PYTHON to prevent multiprocessing workers
-#    from dropping the Conda path and failing psycopg2 imports.
-# 2. PYLANCE FIX: Removed manual psycopg2 imports to clear source resolution errors.
+# UPDATES (V20.19 - FTMO Pacing Fix):
+# 1. RISK FIX: Escalated base risk to 1.5% and scaled risk to 2.0% to meet
+#    the 90-day FTMO challenge pacing targets.
 # =============================================================================
 
 import os
@@ -90,11 +89,11 @@ def _sanitize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     # This ensures 10:00 AM matches Server Time, not Local Time
     config['risk_management']['risk_timezone'] = "Europe/Athens"
 
-    # RISK FIX: Enforce 0.25% Base Risk (Allows ~20 losses before daily limit)
-    config['risk_management']['base_risk_per_trade_percent'] = 0.0025
+    # 🚨 V20.19 RISK FIX: Enforce 1.50% Base Risk to pace 90-day FTMO Target
+    config['risk_management']['base_risk_per_trade_percent'] = 0.0150
     
-    # Enforce 0.50% Scaled Risk (Hot Hand Cap)
-    config['risk_management']['scaled_risk_percent'] = 0.005
+    # 🚨 V20.19 RISK FIX: Enforce 2.00% Scaled Risk (Hot Hand Cap)
+    config['risk_management']['scaled_risk_percent'] = 0.0200
 
     return config
 
