@@ -7,9 +7,11 @@
 # Supports path resolution for both Monolithic and Modular layouts.
 # CRITICAL: Python 3.9 Compatible (No '|' unions).
 #
-# UPDATES (V20.19 - FTMO Pacing Fix):
-# 1. RISK FIX: Escalated base risk to 1.5% and scaled risk to 2.0% to meet
-#    the 90-day FTMO challenge pacing targets.
+# UPDATES (V20.20 - FTMO Survival Protocol):
+# 1. RISK FIX: Reverted base risk to 0.50% and scaled risk to 0.75%. A 1.5% 
+#    risk profile mathematically guarantees a Hard Deck breach on a 4% daily limit.
+# 2. LOT CLAMP: Hardcoded max_lot_size to 5.0 to prevent 15-lot anomalies.
+# 3. STOP FLOOR: Hardcoded min_stop_loss_pips to 20.0 to guarantee spread survival.
 # =============================================================================
 
 import os
@@ -89,11 +91,17 @@ def _sanitize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     # This ensures 10:00 AM matches Server Time, not Local Time
     config['risk_management']['risk_timezone'] = "Europe/Athens"
 
-    # 🚨 V20.19 RISK FIX: Enforce 1.50% Base Risk to pace 90-day FTMO Target
-    config['risk_management']['base_risk_per_trade_percent'] = 0.0150
+    # 🚨 V20.20 SURVIVAL FIX: Revert to 0.50% Base Risk to survive 4% Daily Limit
+    config['risk_management']['base_risk_per_trade_percent'] = 0.0050
     
-    # 🚨 V20.19 RISK FIX: Enforce 2.00% Scaled Risk (Hot Hand Cap)
-    config['risk_management']['scaled_risk_percent'] = 0.0200
+    # 🚨 V20.20 SURVIVAL FIX: Revert to 0.75% Scaled Risk
+    config['risk_management']['scaled_risk_percent'] = 0.0075
+    
+    # 🚨 V20.20 LOT CLAMP: Strictly forbid > 5.0 lots to prevent explosive spread exposure
+    config['risk_management']['max_lot_size'] = 5.0
+    
+    # 🚨 V20.20 STOP FLOOR: Strictly forbid < 20.0 pips SL
+    config['risk_management']['min_stop_loss_pips'] = 20.0
 
     return config
 

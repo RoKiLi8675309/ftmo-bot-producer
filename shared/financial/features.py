@@ -347,7 +347,7 @@ class AdaptiveImbalanceBarGenerator:
         elif "XAU" in s or "XAG" in s:
             base_floor = 5.0
         else:
-            base_floor = 15.0  # Standard FX
+            base_floor = 5.0  # LOWERED from 15.0 to 5.0 to prevent FX data starvation
             
         self.min_threshold = max(base_floor, initial_threshold * 0.5) 
         
